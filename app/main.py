@@ -2179,6 +2179,36 @@ async def debug_user_check(username: str, db: AsyncSession = Depends(get_db)):
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.post("/api/debug/verify-password")
+async def debug_verify_password(username: str, password: str, db: AsyncSession = Depends(get_db)):
+    try:
+        # Get user
+        result = await db.execute(
+            text("SELECT username, password_hash, is_active FROM users WHERE username = :username"),
+            {"username": username}
+        )
+        user = result.fetchone()
+
+        if not user:
+            return {"exists": False, "message": f"User '{username}' not found"}
+
+        # Try to verify password
+        from passlib.context import CryptContext
+        pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+        is_valid = pwd_context.verify(password, user[1])
+
+        return {
+            "exists": True,
+            "username": user[0],
+            "hash_prefix": user[1][:30] if user[1] else None,
+            "is_active": user[2],
+            "password_valid": is_valid
+        }
+    except Exception as e:
+        return {"error": str(e)}
 # ============================================
 # RUN SERVER
 # ============================================
