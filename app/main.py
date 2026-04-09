@@ -2155,6 +2155,30 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
     query = text(f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})")
 
     await db.execute(query, insert_data)
+
+
+@app.get("/api/debug/user-check")
+async def debug_user_check(username: str, db: AsyncSession = Depends(get_db)):
+    try:
+        # Check if user exists
+        result = await db.execute(
+            text("SELECT username, password_hash, is_active, pharmacy_id FROM users WHERE username = :username"),
+            {"username": username}
+        )
+        user = result.fetchone()
+
+        if not user:
+            return {"exists": False, "message": f"User '{username}' not found"}
+
+        return {
+            "exists": True,
+            "username": user[0],
+            "hash_prefix": user[1][:30] if user[1] else None,
+            "is_active": user[2],
+            "pharmacy_id": str(user[3])
+        }
+    except Exception as e:
+        return {"error": str(e)}
 # ============================================
 # RUN SERVER
 # ============================================
