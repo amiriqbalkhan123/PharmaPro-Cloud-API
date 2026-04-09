@@ -1,7 +1,7 @@
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.config import settings
@@ -9,10 +9,12 @@ from app.models import User, Role
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password using bcrypt directly"""
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 
 def get_password_hash(password: str) -> str:
+    """Hash password using bcrypt directly"""
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
