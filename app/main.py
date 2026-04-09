@@ -286,7 +286,21 @@ async def create_medicine(
         db: AsyncSession = Depends(get_db),
         current_user: dict = Depends(get_current_user)
 ):
-    """Add a new medicine to inventory"""
+    """Add a new medicine to inventory with validation"""
+
+    # Validation: Medicine name is required
+    if not request.name or not request.name.strip():
+        return {"success": False, "error": "Medicine name is required"}
+
+    # Validation: Limit name length (database has VARCHAR(100))
+    MAX_NAME_LENGTH = 100
+    if len(request.name) > MAX_NAME_LENGTH:
+        return {"success": False,
+                "error": f"Medicine name too long. Maximum {MAX_NAME_LENGTH} characters, got {len(request.name)}"}
+
+    # Validation: Limit barcode length if provided
+    if request.barcode and len(request.barcode) > 50:
+        return {"success": False, "error": "Barcode too long. Maximum 50 characters"}
 
     medicine_id = uuid.uuid4()
 
@@ -300,7 +314,7 @@ async def create_medicine(
         {
             "id": medicine_id,
             "pharmacy_id": UUID(pharmacy_id),
-            "name": request.name,
+            "name": request.name.strip(),
             "generic_name": request.generic_name,
             "brand": request.brand,
             "dosage_form": request.dosage_form,
@@ -317,8 +331,6 @@ async def create_medicine(
         "success": True,
         "data": {"id": str(medicine_id)}
     }
-
-
 # ============================================
 # UPDATE MEDICINE
 # ============================================
@@ -1343,6 +1355,8 @@ async def create_sale(
     sale_items = []
 
     for item in request.items:
+        if item.quantity <= 0:
+            return {"success": False, "error": f"Quantity must be positive, got {item.quantity}"}
         # Get batch details
         batch_result = await db.execute(
             text("""
@@ -1537,8 +1551,16 @@ async def create_customer(
         current_user: dict = Depends(get_current_user)
 ):
     """
-    Add a new customer
+    Add a new customer with validation
     """
+    # Validation: Customer name is required
+    if not request.full_name or not request.full_name.strip():
+        return {"success": False, "error": "Customer name is required"}
+
+    # Optional: Validate phone format (basic)
+    if request.phone and len(request.phone) < 9:
+        return {"success": False, "error": "Phone number must be at least 9 digits"}
+
     customer_id = uuid.uuid4()
 
     await db.execute(
@@ -1549,7 +1571,7 @@ async def create_customer(
         {
             "id": customer_id,
             "pharmacy_id": UUID(pharmacy_id),
-            "full_name": request.full_name,
+            "full_name": request.full_name.strip(),
             "phone": request.phone,
             "address": request.address,
             "credit_limit": request.credit_limit,
@@ -1563,7 +1585,6 @@ async def create_customer(
         "success": True,
         "data": {"id": str(customer_id)}
     }
-
 
 # ============================================
 # SUPPLIERS - List
