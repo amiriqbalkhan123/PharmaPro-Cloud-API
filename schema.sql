@@ -542,13 +542,12 @@ CREATE TABLE IF NOT EXISTS supplier_return_details (
 
 
 
--- Drop the broken trigger first
-DROP TRIGGER IF EXISTS log_customers_changes ON customers;
+-- 1. First, add default value for sync_version if not exists
+ALTER TABLE customers ALTER COLUMN sync_version SET DEFAULT 1;
+-- Drop existing function
+DROP FUNCTION IF EXISTS log_table_changes() CASCADE;
 
--- Drop the broken function
-DROP FUNCTION IF EXISTS log_table_changes();
-
--- Create the corrected function
+-- Create updated function with skip-trigger flag
 CREATE OR REPLACE FUNCTION log_table_changes()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -556,7 +555,23 @@ DECLARE
     new_data_json JSONB;
     changed_fields_arr TEXT[];
     current_sync_ver INTEGER;
+    skip_triggers BOOLEAN;
 BEGIN
+    -- Check if triggers should be skipped (during sync operations)
+    BEGIN
+        skip_triggers := current_setting('app.skip_triggers', true)::boolean;
+    EXCEPTION WHEN OTHERS THEN
+        skip_triggers := false;
+    END;
+    
+    IF skip_triggers THEN
+        IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+            RETURN NEW;
+        ELSE
+            RETURN OLD;
+        END IF;
+    END IF;
+
     -- Calculate new sync_version
     IF TG_OP = 'DELETE' THEN
         current_sync_ver := COALESCE(OLD.sync_version, 0) + 1;
@@ -614,13 +629,10 @@ BEGIN
         old_data_json := to_jsonb(OLD);
         new_data_json := to_jsonb(NEW);
         
-        -- Fixed: Cast to text for comparison
+        -- Get changed fields
         SELECT array_agg(key) INTO changed_fields_arr
-        FROM (
-            SELECT key 
-            FROM jsonb_each(to_jsonb(NEW))
-            WHERE (jsonb_each.value)::text IS DISTINCT FROM (to_jsonb(OLD)->>key)
-        ) AS changed;
+        FROM jsonb_each(to_jsonb(NEW))
+        WHERE jsonb_each.value::text IS DISTINCT FROM (to_jsonb(OLD)->>key)::text;
         
         NEW.sync_version := current_sync_ver;
         
@@ -648,69 +660,31 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Recreate the trigger
-CREATE TRIGGER log_customers_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON customers 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
-
--- Customers (should already exist)
+-- 3. Drop existing trigger
 DROP TRIGGER IF EXISTS log_customers_changes ON customers;
+
+-- 4. Create new trigger
 CREATE TRIGGER log_customers_changes 
     BEFORE INSERT OR UPDATE OR DELETE ON customers 
     FOR EACH ROW EXECUTE FUNCTION log_table_changes();
 
--- Suppliers
-DROP TRIGGER IF EXISTS log_suppliers_changes ON suppliers;
-CREATE TRIGGER log_suppliers_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON suppliers 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
--- Medicines
-DROP TRIGGER IF EXISTS log_medicines_changes ON medicines;
-CREATE TRIGGER log_medicines_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON medicines 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
--- Batches
-DROP TRIGGER IF EXISTS log_batches_changes ON batches;
-CREATE TRIGGER log_batches_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON batches 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
--- Invoices (Sales)
-DROP TRIGGER IF EXISTS log_invoices_changes ON invoices;
-CREATE TRIGGER log_invoices_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON invoices 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
--- Bills
-DROP TRIGGER IF EXISTS log_bills_changes ON bills;
-CREATE TRIGGER log_bills_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON bills 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
--- Customer Returns
-DROP TRIGGER IF EXISTS log_customer_returns_changes ON customer_returns;
-CREATE TRIGGER log_customer_returns_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON customer_returns 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
--- Supplier Returns
-DROP TRIGGER IF EXISTS log_supplier_returns_changes ON supplier_returns;
-CREATE TRIGGER log_supplier_returns_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON supplier_returns 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
--- Payments
-DROP TRIGGER IF EXISTS log_payments_changes ON payments;
-CREATE TRIGGER log_payments_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON payments 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
 
 
+-- ============================================
+-- ID MAPPING TABLE (Local INTEGER ↔ Cloud UUID)
+-- ============================================
+CREATE TABLE id_mapping (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    table_name VARCHAR(50) NOT NULL,
+    local_id INTEGER NOT NULL,
+    cloud_uuid UUID NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(pharmacy_id, table_name, local_id),
+    UNIQUE(cloud_uuid)
+);
 
-
-
-
+CREATE INDEX idx_id_mapping_pharmacy ON id_mapping(pharmacy_id);
+CREATE INDEX idx_id_mapping_lookup ON id_mapping(pharmacy_id, table_name, local_id);
 

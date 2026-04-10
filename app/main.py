@@ -166,6 +166,63 @@ async def get_dashboard_stats(
 
 
 # ============================================
+# PHARMACY REGISTRATION
+# ============================================
+class RegisterPharmacyRequest(BaseModel):
+    hwid: str
+    name: str = "Pharmacy"
+
+
+@app.post("/api/pharmacy/register")
+async def register_pharmacy(
+        request: RegisterPharmacyRequest,
+        db: AsyncSession = Depends(get_db)
+):
+    """Register a new pharmacy installation"""
+
+    # Check if pharmacy already exists
+    result = await db.execute(
+        text("SELECT id FROM pharmacies WHERE hwid = :hwid"),
+        {"hwid": request.hwid}
+    )
+    existing = result.fetchone()
+
+    if existing:
+        return {
+            "success": True,
+            "pharmacy_id": str(existing[0]),
+            "message": "Pharmacy already registered"
+        }
+
+    # Create new pharmacy
+    pharmacy_id = uuid.uuid4()
+    await db.execute(
+        text("""
+            INSERT INTO pharmacies (id, name, hwid, subscription_type, is_active)
+            VALUES (:id, :name, :hwid, 'trial', TRUE)
+        """),
+        {"id": pharmacy_id, "name": request.name, "hwid": request.hwid}
+    )
+
+    # Create sync_state for this pharmacy
+    await db.execute(
+        text("""
+            INSERT INTO sync_state (pharmacy_id, last_sync_version, sync_status)
+            VALUES (:pharmacy_id, 0, 'idle')
+        """),
+        {"pharmacy_id": pharmacy_id}
+    )
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "pharmacy_id": str(pharmacy_id),
+        "message": "Pharmacy registered successfully"
+    }
+
+
+# ============================================
 # MEDICINES - Search & List
 # ============================================
 @app.get("/api/medicines/search")
@@ -1974,86 +2031,120 @@ async def sync_upload(request: SyncUploadRequest, db: AsyncSession = Depends(get
     """
     Desktop uploads its changes to cloud.
     Uses last-write-wins based on updated_at.
+    Handles local INTEGER IDs via cloud_uuid mapping.
     """
+    # Skip triggers during sync to avoid infinite loops
+    await db.execute(text("SET app.skip_triggers = 'true'"))
+
     processed = 0
     conflicts = 0
     errors = []
 
-    for change in request.changes:
-        try:
-            table_name = change.get("table_name")
-            record_id = UUID(change.get("record_id"))
-            operation = change.get("operation")
-            new_data = change.get("new_data", {})
-            updated_at = datetime.fromisoformat(change.get("updated_at"))
-            sync_version = change.get("sync_version")
+    try:
+        for change in request.changes:
+            try:
+                table_name = change.get("table_name")
+                operation = change.get("operation")
+                new_data = change.get("new_data", {})
+                updated_at = datetime.fromisoformat(change.get("updated_at")) if change.get(
+                    "updated_at") else datetime.utcnow()
+                local_id = change.get("local_id")  # Web app's INTEGER ID
 
-            if operation == "DELETE":
-                # Soft delete
-                query = text(f"""
-                    UPDATE {table_name}
-                    SET is_deleted = TRUE, 
-                        updated_at = :updated_at,
-                        sync_version = sync_version + 1
-                    WHERE id = :record_id 
-                        AND pharmacy_id = :pharmacy_id
-                        AND (updated_at < :updated_at OR updated_at IS NULL)
-                """)
-                result = await db.execute(query, {
-                    "record_id": record_id,
-                    "pharmacy_id": request.pharmacy_id,
-                    "updated_at": updated_at
-                })
-                if result.rowcount > 0:
-                    processed += 1
-                else:
-                    conflicts += 1
+                # Get or generate cloud UUID
+                cloud_uuid = change.get("record_id")
+                if not cloud_uuid:
+                    cloud_uuid = str(uuid.uuid4())
 
-            elif operation in ["INSERT", "UPDATE"]:
-                # Get existing record
-                check_query = text(
-                    f"SELECT id, updated_at FROM {table_name} WHERE id = :record_id AND pharmacy_id = :pharmacy_id")
-                existing = await db.execute(check_query, {"record_id": record_id, "pharmacy_id": request.pharmacy_id})
-                existing_row = existing.first()
+                # Map local ID to cloud UUID if needed
+                if local_id and table_name and request.pharmacy_id:
+                    await db.execute(
+                        text("""
+                            INSERT INTO id_mapping (pharmacy_id, table_name, local_id, cloud_uuid)
+                            VALUES (:pharmacy_id, :table_name, :local_id, :cloud_uuid)
+                            ON CONFLICT (pharmacy_id, table_name, local_id) DO NOTHING
+                        """),
+                        {
+                            "pharmacy_id": request.pharmacy_id,
+                            "table_name": table_name,
+                            "local_id": local_id,
+                            "cloud_uuid": UUID(cloud_uuid)
+                        }
+                    )
 
-                if existing_row and operation == "INSERT":
-                    # Conflict: record exists but desktop sent INSERT
-                    # Use last-write-wins
-                    if updated_at > existing_row[1]:
-                        # Desktop wins - update existing
-                        await update_record(db, table_name, record_id, new_data, updated_at)
+                record_id = UUID(cloud_uuid)
+
+                if operation == "DELETE":
+                    query = text(f"""
+                        UPDATE {table_name}
+                        SET is_deleted = TRUE, 
+                            updated_at = :updated_at,
+                            sync_version = sync_version + 1
+                        WHERE id = :record_id 
+                            AND pharmacy_id = :pharmacy_id
+                            AND (updated_at < :updated_at OR updated_at IS NULL)
+                    """)
+                    result = await db.execute(query, {
+                        "record_id": record_id,
+                        "pharmacy_id": request.pharmacy_id,
+                        "updated_at": updated_at
+                    })
+                    if result.rowcount > 0:
                         processed += 1
                     else:
                         conflicts += 1
 
-                elif existing_row and operation == "UPDATE":
-                    # Update existing with last-write-wins
-                    if updated_at > existing_row[1]:
-                        # Desktop wins
-                        await update_record(db, table_name, record_id, new_data, updated_at)
+                elif operation in ["INSERT", "UPDATE"]:
+                    # Check if record exists
+                    check_query = text(
+                        f"SELECT id, updated_at FROM {table_name} WHERE id = :record_id AND pharmacy_id = :pharmacy_id"
+                    )
+                    existing = await db.execute(check_query, {
+                        "record_id": record_id,
+                        "pharmacy_id": request.pharmacy_id
+                    })
+                    existing_row = existing.first()
+
+                    if existing_row and operation == "INSERT":
+                        # Conflict: record exists but desktop sent INSERT
+                        if updated_at > existing_row[1]:
+                            await update_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
+                            processed += 1
+                        else:
+                            conflicts += 1
+
+                    elif existing_row and operation == "UPDATE":
+                        if updated_at > existing_row[1]:
+                            await update_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
+                            processed += 1
+                        else:
+                            conflicts += 1
+
+                    elif not existing_row and operation == "INSERT":
+                        await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
                         processed += 1
-                    else:
-                        conflicts += 1
 
-                elif not existing_row and operation == "INSERT":
-                    # New record - insert
-                    await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
-                    processed += 1
+            except Exception as e:
+                errors.append(f"Error processing {change.get('table_name')}/{change.get('record_id')}: {str(e)}")
 
-        except Exception as e:
-            errors.append(f"Error processing {change.get('table_name')}/{change.get('record_id')}: {str(e)}")
+        await db.commit()
 
-    await db.commit()
+        # Update sync state
+        await db.execute(text("""
+            UPDATE sync_state 
+            SET last_sync_at = NOW(), 
+                last_sync_version = :version,
+                total_records_synced = total_records_synced + :processed,
+                sync_status = 'completed'
+            WHERE pharmacy_id = :pharmacy_id
+        """), {
+            "version": request.sync_version,
+            "processed": processed,
+            "pharmacy_id": request.pharmacy_id
+        })
 
-    # Update sync state
-    await db.execute(text("""
-        UPDATE sync_state 
-        SET last_sync_at = NOW(), 
-            last_sync_version = :version,
-            total_records_synced = total_records_synced + :processed,
-            sync_status = 'completed'
-        WHERE pharmacy_id = :pharmacy_id
-    """), {"version": request.sync_version, "processed": processed, "pharmacy_id": request.pharmacy_id})
+    finally:
+        # Re-enable triggers
+        await db.execute(text("SET app.skip_triggers = 'false'"))
 
     return SyncUploadResponse(
         success=True,
@@ -2062,7 +2153,6 @@ async def sync_upload(request: SyncUploadRequest, db: AsyncSession = Depends(get
         new_sync_version=request.sync_version + 1,
         errors=errors
     )
-
 
 # ============================================
 # SYNC DOWNLOAD (Desktop pulls changes)
@@ -2130,8 +2220,8 @@ async def update_record(db: AsyncSession, table_name: str, record_id: UUID, data
     await db.execute(query, params)
 
 
-async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data: dict, updated_at: datetime,
-                        pharmacy_id: UUID):
+async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data: dict,
+                        updated_at: datetime, pharmacy_id: UUID):
     """Insert new record with proper column mapping"""
 
     # Prepare the data for insertion
@@ -2143,18 +2233,31 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
         "source": "desktop"
     }
 
-    # Add the incoming data
-    for key, value in data.items():
-        if value is not None and value != "":
-            insert_data[key] = value
+    # Map SQLite field names to PostgreSQL field names
+    field_mapping = {
+        'customer_id': 'id',
+        'medicine_id': 'id',
+        'batch_id': 'id',
+        'invoice_id': 'id',
+        'bill_id': 'id',
+        'supplier_id': 'id',
+        'payment_id': 'id',
+        'full_name': 'full_name',
+        'created_by': 'created_by'
+    }
 
-    # Build the INSERT statement
+    for key, value in data.items():
+        if value is not None and value != "" and key not in ['id', 'pharmacy_id', 'created_at']:
+            # Map SQLite column names to PostgreSQL if needed
+            pg_key = field_mapping.get(key, key)
+            insert_data[pg_key] = value
+
     columns = list(insert_data.keys())
     placeholders = [f":{col}" for col in columns]
 
     query = text(f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})")
-
     await db.execute(query, insert_data)
+
 
 
 @app.get("/api/debug/user-check")
