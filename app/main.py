@@ -3403,7 +3403,44 @@ async def startup_event():
     from app.auth import get_password_hash
 
     async with AsyncSessionLocal() as db:
-        # Create sync system user if not exists
+        # FIRST: Check if roles exist, if not create them
+        roles_check = await db.execute(
+            text("SELECT COUNT(*) FROM roles")
+        )
+        role_count = roles_check.scalar() or 0
+
+        if role_count == 0:
+            # Seed default roles
+            await db.execute(
+                text("""
+                    INSERT INTO roles (id, name, description, permissions) VALUES
+                    (gen_random_uuid(), 'Administrator', 'Full system access', '{"all": true}'::jsonb),
+                    (gen_random_uuid(), 'Pharmacist', 'Can manage medicines and sales', '{"medicines": ["view","add","edit"], "sales": ["pos","view"]}'::jsonb),
+                    (gen_random_uuid(), 'Cashier', 'Processes sales only', '{"sales": ["pos","view"], "customers": ["view","add"]}'::jsonb),
+                    (gen_random_uuid(), 'Manager', 'Manager with limited deletion', '{"medicines": ["view","add","edit"], "reports": ["view","export"]}'::jsonb),
+                    (gen_random_uuid(), 'Staff', 'Basic read-only access', '{"medicines": ["view"], "sales": ["view"]}'::jsonb)
+                """)
+            )
+            await db.commit()
+            print("✅ Default roles created")
+
+        # Check if pharmacy exists
+        pharmacy_check = await db.execute(
+            text("SELECT COUNT(*) FROM pharmacies")
+        )
+        pharmacy_count = pharmacy_check.scalar() or 0
+
+        if pharmacy_count == 0:
+            await db.execute(
+                text("""
+                    INSERT INTO pharmacies (id, name, hwid, subscription_type, is_active)
+                    VALUES (gen_random_uuid(), 'Default Pharmacy', 'DEFAULT-HWID-001', 'trial', TRUE)
+                """)
+            )
+            await db.commit()
+            print("✅ Default pharmacy created")
+
+        # NOW create sync system user if not exists
         sync_user_check = await db.execute(
             text("SELECT id FROM users WHERE username = 'sync_system'")
         )
@@ -3411,24 +3448,27 @@ async def startup_event():
             admin_role = await db.execute(
                 text("SELECT id FROM roles WHERE name = 'Administrator'")
             )
-            role_id = admin_role.fetchone()[0]
-            pharmacy = await db.execute(text("SELECT id FROM pharmacies LIMIT 1"))
-            pharmacy_id = pharmacy.fetchone()[0]
+            role_row = admin_role.fetchone()
+            if role_row:
+                role_id = role_row[0]
+                pharmacy = await db.execute(text("SELECT id FROM pharmacies LIMIT 1"))
+                pharmacy_row = pharmacy.fetchone()
+                if pharmacy_row:
+                    pharmacy_id = pharmacy_row[0]
 
-            await db.execute(
-                text("""
-                    INSERT INTO users (id, pharmacy_id, role_id, fullname, username, password_hash, email, is_active, is_verified)
-                    VALUES (gen_random_uuid(), :pharmacy_id, :role_id, 'Sync System', 'sync_system', :password_hash, 'sync@system.local', TRUE, TRUE)
-                """),
-                {
-                    "pharmacy_id": pharmacy_id,
-                    "role_id": role_id,
-                    "password_hash": get_password_hash('SyncSystem2024!')
-                }
-            )
-            await db.commit()
-            print("✅ Sync system user created")
-
+                    await db.execute(
+                        text("""
+                            INSERT INTO users (id, pharmacy_id, role_id, fullname, username, password_hash, email, is_active, is_verified)
+                            VALUES (gen_random_uuid(), :pharmacy_id, :role_id, 'Sync System', 'sync_system', :password_hash, 'sync@system.local', TRUE, TRUE)
+                        """),
+                        {
+                            "pharmacy_id": pharmacy_id,
+                            "role_id": role_id,
+                            "password_hash": get_password_hash('SyncSystem2024!')
+                        }
+                    )
+                    await db.commit()
+                    print("✅ Sync system user created")
 
 if __name__ == "__main__":
     import uvicorn
