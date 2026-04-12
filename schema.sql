@@ -1,3 +1,4 @@
+
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -396,6 +397,47 @@ CREATE TABLE sync_state (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+
+
+
+
+
+-- Create categories table
+CREATE TABLE IF NOT EXISTS categories (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    name VARCHAR(50) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    sync_version INTEGER DEFAULT 1,
+    source VARCHAR(20) DEFAULT 'desktop'
+);
+
+-- Add category_id to medicines table
+ALTER TABLE medicines ADD COLUMN category_id UUID REFERENCES categories(id);
+
+-- Create indexes
+CREATE INDEX idx_categories_pharmacy ON categories(pharmacy_id);
+CREATE INDEX idx_categories_name ON categories(name);
+CREATE INDEX idx_medicines_category ON medicines(category_id);
+
+-- Create trigger for categories
+CREATE TRIGGER update_categories_updated_at 
+    BEFORE UPDATE ON categories 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+
+-- Create trigger for categories change logging
+CREATE TRIGGER log_categories_changes 
+    BEFORE INSERT OR UPDATE OR DELETE ON categories 
+    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+
+
+
+
+
 -- ============================================
 -- 19. CREATE INDEXES (AFTER all tables)
 -- ============================================
@@ -688,3 +730,112 @@ CREATE TABLE id_mapping (
 CREATE INDEX idx_id_mapping_pharmacy ON id_mapping(pharmacy_id);
 CREATE INDEX idx_id_mapping_lookup ON id_mapping(pharmacy_id, table_name, local_id);
 
+
+
+
+-- Add index for faster lookups
+CREATE INDEX IF NOT EXISTS idx_id_mapping_lookup ON id_mapping(pharmacy_id, table_name, local_id);
+CREATE INDEX IF NOT EXISTS idx_id_mapping_cloud ON id_mapping(cloud_uuid);
+
+
+
+-- Create mapping table for desktop unit types to cloud unit types
+CREATE TABLE unit_type_mapping (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    desktop_unit_type_id INTEGER NOT NULL,  -- Desktop's integer ID
+    cloud_unit_type_id UUID NOT NULL REFERENCES unit_types(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(pharmacy_id, desktop_unit_type_id)
+);
+
+CREATE INDEX idx_unit_type_mapping_pharmacy ON unit_type_mapping(pharmacy_id);
+CREATE INDEX idx_unit_type_mapping_desktop ON unit_type_mapping(desktop_unit_type_id);
+
+
+
+-- Create batch_units table (one-to-one with batches)
+CREATE TABLE batch_units (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    batch_id UUID NOT NULL UNIQUE REFERENCES batches(id) ON DELETE CASCADE,
+    unit_type_id UUID NOT NULL REFERENCES unit_types(id),
+    pack_size INTEGER,
+    subunit_size INTEGER,
+    smallest_unit_factor INTEGER NOT NULL DEFAULT 1,
+    purchase_price_per_unit DECIMAL(10,2) NOT NULL,
+    selling_price_per_unit DECIMAL(10,2) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    sync_version INTEGER DEFAULT 1,
+    source VARCHAR(20) DEFAULT 'desktop'
+);
+
+-- Remove unit columns from batches table
+ALTER TABLE batches DROP COLUMN IF EXISTS unit_type_id;
+ALTER TABLE batches DROP COLUMN IF EXISTS pack_size;
+ALTER TABLE batches DROP COLUMN IF EXISTS subunit_size;
+ALTER TABLE batches DROP COLUMN IF EXISTS smallest_unit_factor;
+
+-- Create indexes
+CREATE INDEX idx_batch_units_batch ON batch_units(batch_id);
+CREATE INDEX idx_batch_units_unit_type ON batch_units(unit_type_id);
+CREATE INDEX idx_batch_units_pharmacy ON batch_units(pharmacy_id);
+
+-- Create trigger
+CREATE TRIGGER update_batch_units_updated_at 
+    BEFORE UPDATE ON batch_units 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+
+
+CREATE TABLE medicine_packaging_templates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    medicine_id UUID NOT NULL REFERENCES medicines(id) ON DELETE CASCADE,
+    purchase_unit_id UUID NOT NULL REFERENCES unit_types(id),
+    pack_size INTEGER,
+    subunit_size INTEGER,
+    smallest_unit_factor INTEGER NOT NULL DEFAULT 1,
+    is_default BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    sync_version INTEGER DEFAULT 1,
+    source VARCHAR(20) DEFAULT 'desktop'
+);
+
+CREATE INDEX idx_med_template_medicine ON medicine_packaging_templates(medicine_id);
+CREATE INDEX idx_med_template_unit ON medicine_packaging_templates(purchase_unit_id);
+CREATE INDEX idx_med_template_pharmacy ON medicine_packaging_templates(pharmacy_id);
+
+CREATE TRIGGER update_med_template_updated_at 
+    BEFORE UPDATE ON medicine_packaging_templates 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+
+
+-- Make pharmacy_id nullable (allow NULL for system units)
+ALTER TABLE unit_types ALTER COLUMN pharmacy_id DROP NOT NULL;
+
+-- Now add is_system column if not exists
+ALTER TABLE unit_types ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE;
+
+-- Now insert default system unit types (pharmacy_id will be NULL)
+INSERT INTO unit_types (id, name, is_smallest_unit, is_system, created_at) VALUES
+(gen_random_uuid(), 'Pack', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Strip', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Tablet', TRUE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Capsule', TRUE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Bottle', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Box', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Ampoule', TRUE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Vial', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Sachet', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Tube', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Inhaler', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), 'Drop', TRUE, TRUE, CURRENT_TIMESTAMP);
+
+-- Create index for system units
+CREATE INDEX IF NOT EXISTS idx_unit_types_system ON unit_types(is_system);

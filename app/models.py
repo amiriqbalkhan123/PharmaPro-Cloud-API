@@ -88,3 +88,58 @@ class Customer(Base):
 
     created_at = Column(DateTime, server_default=func.now())
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+
+
+class Categories(Base):
+    __tablename__ = "categories"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id"), nullable=False)
+    name = Column(String(50), nullable=False)
+    description = Column(Text)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    is_deleted = Column(Boolean, default=False)
+    sync_version = Column(Integer, default=1)
+    source = Column(String(20), default="desktop")
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
+
+class BatchUnits(Base):
+    __tablename__ = "batch_units"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id"), nullable=False)
+    batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"), unique=True, nullable=False)
+    unit_type_id = Column(UUID(as_uuid=True), ForeignKey("unit_types.id"), nullable=False)
+    pack_size = Column(Integer, nullable=True)
+    subunit_size = Column(Integer, nullable=True)
+    smallest_unit_factor = Column(Integer, nullable=False, default=1)
+    purchase_price_per_unit = Column(Numeric(10, 2), nullable=False)
+    selling_price_per_unit = Column(Numeric(10, 2), nullable=False)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    is_deleted = Column(Boolean, default=False)
+    sync_version = Column(Integer, default=1)
+    source = Column(String(20), default="desktop")
+
+
+class MedicinePackagingTemplate(Base):
+    __tablename__ = "medicine_packaging_templates"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id"), nullable=False)
+    medicine_id = Column(UUID(as_uuid=True), ForeignKey("medicines.id"), nullable=False)
+    purchase_unit_id = Column(UUID(as_uuid=True), ForeignKey("unit_types.id"), nullable=False)
+    pack_size = Column(Integer, nullable=True)
+    subunit_size = Column(Integer, nullable=True)
+    smallest_unit_factor = Column(Integer, nullable=False, default=1)
+    is_default = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    is_deleted = Column(Boolean, default=False)
+    sync_version = Column(Integer, default=1)
+    source = Column(String(20), default="desktop")
