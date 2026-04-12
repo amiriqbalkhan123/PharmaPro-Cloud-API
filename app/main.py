@@ -3169,7 +3169,7 @@ async def update_record(db: AsyncSession, table_name: str, record_id: UUID, data
 
 async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data: dict,
                         updated_at: datetime, pharmacy_id: UUID):
-    """Insert new record with proper column mapping"""
+    """Insert new record with proper column mapping and FK UUID resolution"""
 
     # Remove fields that shouldn't be inserted
     data.pop("id", None)
@@ -3181,6 +3181,61 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
     # Extract cloud_uuid if present - we'll use it as the id
     cloud_uuid = data.pop("cloud_uuid", None)
     actual_id = UUID(cloud_uuid) if cloud_uuid else record_id
+
+    # ========== FK UUID RESOLUTION ==========
+    fk_mappings = {
+        'category_id': 'categories',
+        'medicine_id': 'medicines',
+        'customer_id': 'customers',
+        'supplier_id': 'suppliers',
+        'batch_id': 'batches',
+        'invoice_id': 'invoices',
+        'bill_id': 'bills',
+        'purchase_unit_id': 'unit_types',
+        'unit_type_id': 'unit_types',
+        'return_id': 'customer_returns',
+        'payment_id': 'payments',
+        'user_id': 'users',
+        'role_id': 'roles'
+    }
+
+    for fk_field, fk_table in fk_mappings.items():
+        if fk_field in data and data[fk_field] is not None and data[fk_field] != "":
+            local_fk_value = data[fk_field]
+
+            # Check if it's already a UUID (36 chars with hyphens)
+            if isinstance(local_fk_value, str) and len(local_fk_value) == 36 and '-' in local_fk_value:
+                # Already a UUID, keep as is
+                continue
+
+            # Try to convert to int (local INTEGER ID)
+            try:
+                local_id = int(local_fk_value)
+
+                # Look up cloud UUID from id_mapping
+                mapping_result = await db.execute(
+                    text("""
+                        SELECT cloud_uuid FROM id_mapping 
+                        WHERE pharmacy_id = :pharmacy_id 
+                            AND table_name = :table_name 
+                            AND local_id = :local_id
+                    """),
+                    {
+                        "pharmacy_id": pharmacy_id,
+                        "table_name": fk_table,
+                        "local_id": local_id
+                    }
+                )
+                mapping_row = mapping_result.fetchone()
+                if mapping_row:
+                    data[fk_field] = mapping_row[0]  # Replace with cloud UUID
+                    print(f"   ✅ Mapped {fk_field}: {local_id} -> {mapping_row[0]}")
+                else:
+                    print(f"   ⚠️ {fk_field}={local_id} not found in id_mapping for {fk_table}")
+                    data[fk_field] = None  # Set to NULL if mapping not found
+            except (ValueError, TypeError):
+                # Not an integer, leave as is (might be UUID already)
+                pass
 
     # Base insert data
     insert_data = {
@@ -3223,14 +3278,24 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
         'balance_due': 'balance_due',
         'due_date': 'due_date',
         'created_by': 'created_by',
-        # NEW MAPPINGS FOR CATEGORIES AND PACKAGING
         'category_id': 'category_id',
         'purchase_unit_id': 'purchase_unit_id',
         'pack_size': 'pack_size',
         'subunit_size': 'subunit_size',
         'smallest_unit_factor': 'smallest_unit_factor',
         'is_default': 'is_default',
-        'unit_type_id': 'unit_type_id'
+        'unit_type_id': 'unit_type_id',
+        'return_date': 'return_date',
+        'total_amount': 'total_amount',
+        'reason': 'reason',
+        'party_type': 'party_type',
+        'reference_id': 'reference_id',
+        'method': 'method',
+        'payment_date': 'payment_date',
+        'notes': 'notes',
+        'quantity': 'quantity',
+        'unit_price': 'unit_price',
+        'description': 'description'
     }
 
     # Add mapped fields
@@ -3243,16 +3308,25 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
                           'purchase_price', 'selling_price', 'quantity_received', 'quantity_remaining',
                           'total_amount', 'discount', 'net_amount', 'amount_paid', 'balance_due',
                           'category_id', 'purchase_unit_id', 'pack_size', 'subunit_size',
-                          'smallest_unit_factor', 'is_default', 'unit_type_id']:
+                          'smallest_unit_factor', 'is_default', 'unit_type_id', 'return_date',
+                          'reason', 'party_type', 'method', 'payment_date', 'notes', 'quantity',
+                          'unit_price', 'description']:
                 insert_data[pg_key] = value
-            elif pg_key == 'expiry_date' or pg_key == 'last_payment_date' or pg_key == 'due_date':
+            elif pg_key == 'expiry_date' or pg_key == 'last_payment_date' or pg_key == 'due_date' or pg_key == 'return_date' or pg_key == 'payment_date':
                 if isinstance(value, str):
-                    insert_data[pg_key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                    try:
+                        insert_data[pg_key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                    except:
+                        insert_data[pg_key] = value
                 else:
                     insert_data[pg_key] = value
-            elif pg_key == 'created_by':
+            elif pg_key == 'created_by' or pg_key == 'reference_id':
                 try:
-                    insert_data[pg_key] = UUID(value) if value else None
+                    if isinstance(value, str) and len(value) == 36:
+                        insert_data[pg_key] = UUID(value)
+                    elif value is not None:
+                        # Try to map from id_mapping
+                        pass
                 except:
                     pass
 
@@ -3263,33 +3337,33 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
     query = text(f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})")
 
     try:
+        print(f"   📝 Inserting into {table_name}: {columns}")
         await db.execute(query, insert_data)
+        print(f"   ✅ INSERT successful for {table_name}")
 
-        # ========== NEW: Handle batch_units when inserting a batch ==========
+        # ========== Handle batch_units when inserting a batch ==========
         if table_name == 'batches':
-            # Extract unit information from data (original data, not insert_data)
             unit_type_id = data.get('unit_type_id')
             pack_size = data.get('pack_size')
             subunit_size = data.get('subunit_size')
             smallest_unit_factor = data.get('smallest_unit_factor', 1)
 
             if unit_type_id:
-                # Convert unit_type_id to UUID if it's a string
                 try:
                     unit_type_uuid = UUID(unit_type_id) if isinstance(unit_type_id, str) else unit_type_id
                 except:
-                    # If it's not a UUID, try to find the system unit by name
                     unit_name = str(unit_type_id)
                     unit_result = await db.execute(
-                        text(
-                            "SELECT id FROM unit_types WHERE name = :name AND (is_system = TRUE OR pharmacy_id = :pharmacy_id)"),
+                        text("""
+                            SELECT id FROM unit_types 
+                            WHERE name = :name AND (is_system = TRUE OR pharmacy_id = :pharmacy_id)
+                        """),
                         {"name": unit_name, "pharmacy_id": pharmacy_id}
                     )
                     unit_row = unit_result.fetchone()
                     if unit_row:
                         unit_type_uuid = unit_row[0]
                     else:
-                        # Create new unit type for this pharmacy
                         unit_type_uuid = uuid.uuid4()
                         await db.execute(
                             text("""
@@ -3299,7 +3373,6 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
                             {"id": unit_type_uuid, "pharmacy_id": pharmacy_id, "name": unit_name}
                         )
 
-                # Insert batch_units record
                 batch_unit_id = uuid.uuid4()
                 await db.execute(
                     text("""
@@ -3326,18 +3399,13 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
                         "selling_price": data.get('selling_price', 0)
                     }
                 )
-
-        # ========== NEW: Handle medicine_packaging_templates ==========
-        elif table_name == 'medicine_packaging_templates':
-            # Already inserted, nothing extra needed
-            pass
+                print(f"   ✅ Created batch_units for batch")
 
     except Exception as e:
-        print(f"Insert error for {table_name}: {e}")
-        print(f"Columns: {columns}")
-        print(f"Data keys: {list(insert_data.keys())}")
+        print(f"   ❌ Insert error for {table_name}: {e}")
+        print(f"   Columns: {columns}")
+        print(f"   Data keys: {list(insert_data.keys())}")
         raise
-
 
 ## Unit Types mapping endpoint
 @app.post("/api/unit-types/map")
