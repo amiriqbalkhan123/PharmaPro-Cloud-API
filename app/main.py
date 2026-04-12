@@ -2609,6 +2609,9 @@ async def login(login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
 # ============================================
 # SYNC UPLOAD (Desktop pushes changes)
 # ============================================
+# ============================================
+# SYNC UPLOAD (Desktop pushes changes)
+# ============================================
 @app.post("/api/sync/upload", response_model=SyncUploadResponse)
 async def sync_upload(
         request: SyncUploadRequest,
@@ -2621,6 +2624,21 @@ async def sync_upload(
     Handles local INTEGER IDs via cloud_uuid mapping.
     Logs conflicts for audit purposes.
     """
+    print("=" * 60)
+    print(f"🔍 SYNC UPLOAD RECEIVED: {len(request.changes)} changes")
+    print(f"   Pharmacy ID: {request.pharmacy_id}")
+    print(f"   Sync Version: {request.sync_version}")
+
+    for i, change in enumerate(request.changes):
+        print(f"   Change {i + 1}:")
+        print(f"      Table: {change.get('table_name')}")
+        print(f"      Operation: {change.get('operation')}")
+        print(f"      Record ID: {change.get('record_id')}")
+        print(f"      Local ID: {change.get('local_id')}")
+        print(f"      New Data Keys: {list(change.get('new_data', {}).keys())}")
+        print(f"      Updated At: {change.get('updated_at')}")
+    print("=" * 60)
+
     # Skip triggers during sync to avoid infinite loops
     await db.execute(text("SET app.skip_triggers = 'true'"))
 
@@ -2630,9 +2648,12 @@ async def sync_upload(
 
     try:
         for change in request.changes:
+            table_name = change.get("table_name")
+            operation = change.get("operation")
+
+            print(f"\n📝 Processing: {table_name} - {operation}")
+
             try:
-                table_name = change.get("table_name")
-                operation = change.get("operation")
                 new_data = change.get("new_data", {})
                 updated_at = datetime.fromisoformat(change.get("updated_at")) if change.get(
                     "updated_at") else datetime.utcnow()
@@ -2641,9 +2662,11 @@ async def sync_upload(
 
                 # Determine cloud UUID
                 cloud_uuid = cloud_uuid_from_desktop
+                print(f"   Initial cloud_uuid: {cloud_uuid}")
 
                 # If no UUID provided, check mapping table
                 if not cloud_uuid and local_id and table_name and request.pharmacy_id:
+                    print(f"   Looking up mapping for local_id: {local_id}")
                     mapping_result = await db.execute(
                         text("""
                             SELECT cloud_uuid FROM id_mapping 
@@ -2660,15 +2683,18 @@ async def sync_upload(
                     existing = mapping_result.fetchone()
                     if existing:
                         cloud_uuid = str(existing[0])
+                        print(f"   Found mapping: {cloud_uuid}")
 
                 # If still no UUID, generate new one
                 if not cloud_uuid:
                     cloud_uuid = str(uuid.uuid4())
+                    print(f"   Generated new cloud_uuid: {cloud_uuid}")
 
                 record_id = UUID(cloud_uuid)
 
                 # Create or update mapping
                 if local_id and table_name and request.pharmacy_id:
+                    print(f"   Saving id_mapping: {table_name} local_id={local_id} -> {cloud_uuid}")
                     await db.execute(
                         text("""
                             INSERT INTO id_mapping (pharmacy_id, table_name, local_id, cloud_uuid)
@@ -2685,6 +2711,7 @@ async def sync_upload(
                     )
 
                 if operation == "DELETE":
+                    print(f"   Processing DELETE for {table_name}")
                     check_query = text(f"""
                         SELECT id, updated_at, to_jsonb({table_name}) as record_data
                         FROM {table_name} 
@@ -2695,6 +2722,7 @@ async def sync_upload(
                         "pharmacy_id": request.pharmacy_id
                     })
                     existing_row = existing_record.first()
+                    print(f"   Record exists: {existing_row is not None}")
 
                     if existing_row:
                         query = text(f"""
@@ -2713,8 +2741,10 @@ async def sync_upload(
                         })
                         if result.rowcount > 0:
                             processed += 1
+                            print(f"   ✅ DELETE processed")
                         else:
                             conflicts += 1
+                            print(f"   ⚠️ DELETE conflict - cloud record newer")
                             # Log DELETE conflict
                             cloud_data = dict(existing_row[2]) if existing_row and len(existing_row) > 2 else None
                             await db.execute(
@@ -2747,19 +2777,22 @@ async def sync_upload(
                         "pharmacy_id": request.pharmacy_id
                     })
                     existing_row = existing.first()
+                    print(f"   Record exists: {existing_row is not None}")
 
                     existing_updated_at = existing_row[1] if existing_row else None
                     existing_data = dict(existing_row[2]) if existing_row and len(existing_row) > 2 else None
 
                     if existing_row and operation == "INSERT":
-                        # Conflict: record exists but desktop sent INSERT
+                        print(f"   ⚠️ INSERT conflict - record already exists")
                         if updated_at > existing_updated_at:
                             await update_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
                             processed += 1
                             winner = "desktop"
+                            print(f"   ✅ Desktop wins (newer timestamp)")
                         else:
                             conflicts += 1
                             winner = "cloud"
+                            print(f"   ⚠️ Cloud wins (newer timestamp)")
 
                         # Log INSERT conflict
                         await db.execute(
@@ -2788,13 +2821,16 @@ async def sync_upload(
                         )
 
                     elif existing_row and operation == "UPDATE":
+                        print(f"   Processing UPDATE")
                         if updated_at > existing_updated_at:
                             await update_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
                             processed += 1
                             winner = "desktop"
+                            print(f"   ✅ Desktop wins (newer timestamp)")
                         else:
                             conflicts += 1
                             winner = "cloud"
+                            print(f"   ⚠️ Cloud wins (newer timestamp)")
 
                         # Log UPDATE conflict
                         await db.execute(
@@ -2823,15 +2859,29 @@ async def sync_upload(
                         )
 
                     elif not existing_row and operation == "INSERT":
-                        await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
-                        processed += 1
+                        print(f"   → Calling insert_record for {table_name}")
+                        print(f"   New data: {new_data}")
+                        try:
+                            await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
+                            processed += 1
+                            print(f"   ✅ INSERT successful for {table_name}")
+                        except Exception as insert_error:
+                            print(f"   ❌ INSERT failed in insert_record: {str(insert_error)}")
+                            raise
 
             except Exception as e:
-                errors.append(f"Error processing {change.get('table_name')}/{change.get('record_id')}: {str(e)}")
+                error_msg = f"Error processing {change.get('table_name')}/{change.get('record_id')}: {str(e)}"
+                print(f"   ❌ ERROR: {error_msg}")
+                errors.append(error_msg)
+                import traceback
+                traceback.print_exc()
 
+        print(f"\n💾 Committing transaction...")
         await db.commit()
+        print(f"✅ Commit successful. Processed: {processed}, Conflicts: {conflicts}")
 
         # Update sync state
+        print(f"📝 Updating sync_state...")
         await db.execute(text("""
             UPDATE sync_state 
             SET last_sync_at = NOW(), 
@@ -2844,10 +2894,17 @@ async def sync_upload(
             "processed": processed,
             "pharmacy_id": request.pharmacy_id
         })
+        print(f"✅ sync_state updated")
+
+    except Exception as outer_error:
+        print(f"❌ OUTER EXCEPTION: {str(outer_error)}")
+        import traceback
+        traceback.print_exc()
 
     finally:
         # Re-enable triggers
         await db.execute(text("SET app.skip_triggers = 'false'"))
+        print("=" * 60)
 
     return SyncUploadResponse(
         success=True,
@@ -2856,8 +2913,6 @@ async def sync_upload(
         new_sync_version=request.sync_version + 1,
         errors=errors
     )
-
-
 # ============================================
 # CATEGORIES - CRUD Operations
 # ============================================
