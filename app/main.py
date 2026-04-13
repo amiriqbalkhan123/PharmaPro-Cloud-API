@@ -991,43 +991,66 @@ class AddBatchRequest(BaseModel):
     quantity: int
 
 
+
+
 @app.post("/api/medicines/{medicine_id}/batches")
 async def add_batch(
-        medicine_id: str,
-        request: AddBatchRequest,
-        pharmacy_id: str,
-        db: AsyncSession = Depends(get_db),
-        current_user: dict = Depends(get_current_user)
+    medicine_id: str,
+    request: AddBatchRequest,
+    pharmacy_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
     """Add a new batch (stock) to a medicine"""
+    requested_pharmacy_id = UUID(pharmacy_id)
+    await assert_pharmacy_access(requested_pharmacy_id, current_user)
 
-    # Verify medicine exists
     medicine_check = await db.execute(
-        text("SELECT id FROM medicines WHERE id = :id AND pharmacy_id = :pharmacy_id AND is_deleted = FALSE"),
-        {"id": UUID(medicine_id), "pharmacy_id": UUID(pharmacy_id)}
+        text("""
+            SELECT id
+            FROM medicines
+            WHERE id = :id
+              AND pharmacy_id = :pharmacy_id
+              AND is_deleted = FALSE
+        """),
+        {
+            "id": UUID(medicine_id),
+            "pharmacy_id": requested_pharmacy_id
+        }
     )
     if not medicine_check.fetchone():
         return {"success": False, "error": "Medicine not found"}
+
+    created_by = None
+    sub = current_user.get("sub")
+    if sub and not str(sub).startswith("pharmacy:"):
+        created_by = UUID(str(sub))
 
     batch_id = uuid.uuid4()
 
     await db.execute(
         text("""
-            INSERT INTO batches (id, pharmacy_id, medicine_id, batch_number, expiry_date, 
-                purchase_price, selling_price, quantity_received, quantity_remaining, created_by, source)
-            VALUES (:id, :pharmacy_id, :medicine_id, :batch_number, :expiry_date, 
-                :purchase_price, :selling_price, :quantity, :quantity, :created_by, 'mobile')
+            INSERT INTO batches (
+                id, pharmacy_id, medicine_id, batch_number, expiry_date,
+                purchase_price, selling_price, quantity_received, quantity_remaining,
+                created_by, source
+            )
+            VALUES (
+                :id, :pharmacy_id, :medicine_id, :batch_number, :expiry_date,
+                :purchase_price, :selling_price, :quantity, :quantity,
+                :created_by, 'mobile'
+            )
         """),
         {
             "id": batch_id,
-            "pharmacy_id": UUID(pharmacy_id),
+            "pharmacy_id": requested_pharmacy_id,
             "medicine_id": UUID(medicine_id),
             "batch_number": request.batch_number,
             "expiry_date": datetime.strptime(request.expiry_date, "%Y-%m-%d").date(),
             "purchase_price": request.purchase_price,
             "selling_price": request.selling_price,
             "quantity": request.quantity,
-            "created_by": UUID(current_user.get("sub"))
+            "created_by": created_by
         }
     )
 
