@@ -3933,19 +3933,35 @@ async def get_categories(
 
 @app.post("/api/categories")
 async def create_category(
-        request: CategoryCreate,
-        pharmacy_id: str,
-        db: AsyncSession = Depends(get_db),
-        current_user: dict = Depends(get_current_user)
+    request: CategoryCreate,
+    pharmacy_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
 ):
     """Create a new category"""
-    # Check if category with same name exists
+    requested_pharmacy_id = UUID(pharmacy_id)
+    await assert_pharmacy_access(requested_pharmacy_id, current_user)
+
     existing = await db.execute(
-        text("SELECT id FROM categories WHERE pharmacy_id = :pharmacy_id AND name = :name AND is_deleted = FALSE"),
-        {"pharmacy_id": UUID(pharmacy_id), "name": request.name}
+        text("""
+            SELECT id
+            FROM categories
+            WHERE pharmacy_id = :pharmacy_id
+              AND name = :name
+              AND is_deleted = FALSE
+        """),
+        {
+            "pharmacy_id": requested_pharmacy_id,
+            "name": request.name.strip(),
+        }
     )
     if existing.fetchone():
         return {"success": False, "error": "Category with this name already exists"}
+
+    created_by = None
+    sub = current_user.get("sub")
+    if sub and not str(sub).startswith("pharmacy:"):
+        created_by = UUID(str(sub))
 
     category_id = uuid.uuid4()
     await db.execute(
@@ -3955,10 +3971,10 @@ async def create_category(
         """),
         {
             "id": category_id,
-            "pharmacy_id": UUID(pharmacy_id),
-            "name": request.name,
+            "pharmacy_id": requested_pharmacy_id,
+            "name": request.name.strip(),
             "description": request.description,
-            "created_by": UUID(current_user.get("sub"))
+            "created_by": created_by
         }
     )
 
