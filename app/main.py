@@ -13,11 +13,27 @@ from app.database import get_db
 from app.schemas import *
 from app.auth import authenticate_user, create_access_token
 from pydantic import BaseModel
-
+import json
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
+
+
+
+
+# ============================================
+# SYNC TABLE WHITELIST - Security Measure
+# ============================================
+ALLOWED_SYNC_TABLES = {
+    'pharmacies', 'users', 'roles', 'customers', 'suppliers',
+    'categories', 'unit_types', 'medicines', 'batches', 'batch_units',
+    'medicine_packaging_templates', 'invoices', 'invoice_details',
+    'bills', 'bill_details', 'customer_returns', 'customer_return_details',
+    'supplier_returns', 'supplier_return_details', 'payments',
+    'inventory_logs', 'activity_logs'
+}
+
 
 security = HTTPBearer()
 
@@ -2603,12 +2619,552 @@ async def login(login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
     )
 
 
+
 # ============================================
-# SYNC UPLOAD (Desktop pushes changes)
+# USERS - CRUD Operations
 # ============================================
+@app.get("/api/users")
+async def get_users(
+        pharmacy_id: str,
+        page: int = 1,
+        limit: int = 50,
+        db: AsyncSession = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    """Get all users for a pharmacy"""
+    offset = (page - 1) * limit
+
+    query = text("""
+        SELECT u.id, u.fullname, u.username, u.email, u.phone, u.is_active, 
+               u.is_verified, u.created_at, u.updated_at, r.id as role_id, r.name as role_name
+        FROM users u
+        LEFT JOIN roles r ON r.id = u.role_id
+        WHERE u.pharmacy_id = :pharmacy_id AND u.is_deleted = FALSE
+        ORDER BY u.fullname
+        LIMIT :limit OFFSET :offset
+    """)
+
+    result = await db.execute(query, {
+        "pharmacy_id": UUID(pharmacy_id),
+        "limit": limit,
+        "offset": offset
+    })
+
+    users = []
+    for row in result:
+        users.append({
+            "id": str(row[0]),
+            "fullname": row[1],
+            "username": row[2],
+            "email": row[3],
+            "phone": row[4],
+            "is_active": row[5],
+            "is_verified": row[6],
+            "created_at": row[7].isoformat() if row[7] else None,
+            "updated_at": row[8].isoformat() if row[8] else None,
+            "role": {
+                "id": str(row[9]) if row[9] else None,
+                "name": row[10]
+            }
+        })
+
+    count_result = await db.execute(
+        text("SELECT COUNT(*) FROM users WHERE pharmacy_id = :pharmacy_id AND is_deleted = FALSE"),
+        {"pharmacy_id": UUID(pharmacy_id)}
+    )
+    total = count_result.scalar() or 0
+
+    return {
+        "success": True,
+        "data": users,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+
 # ============================================
-# SYNC UPLOAD (Desktop pushes changes)
+# ROLES - CRUD Operations
 # ============================================
+@app.get("/api/roles")
+async def get_roles(
+        db: AsyncSession = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    """Get all available roles"""
+    result = await db.execute(
+        text("SELECT id, name, description, permissions, created_at FROM roles ORDER BY name")
+    )
+
+    roles = []
+    for row in result:
+        roles.append({
+            "id": str(row[0]),
+            "name": row[1],
+            "description": row[2],
+            "permissions": row[3],
+            "created_at": row[4].isoformat() if row[4] else None
+        })
+
+    return {"success": True, "data": roles}
+
+
+# ============================================
+# PAYMENTS - List & Search
+# ============================================
+@app.get("/api/payments")
+async def get_payments(
+        pharmacy_id: str,
+        party_type: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page: int = 1,
+        limit: int = 50,
+        db: AsyncSession = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    """Get payments with filters"""
+    offset = (page - 1) * limit
+
+    conditions = ["p.pharmacy_id = :pharmacy_id", "p.is_deleted = FALSE"]
+    params = {"pharmacy_id": UUID(pharmacy_id), "limit": limit, "offset": offset}
+
+    if party_type:
+        conditions.append("p.party_type = :party_type")
+        params["party_type"] = party_type
+    if start_date:
+        conditions.append("p.payment_date >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        conditions.append("p.payment_date <= :end_date")
+        params["end_date"] = end_date
+
+    where_clause = " AND ".join(conditions)
+
+    query = text(f"""
+        SELECT p.id, p.party_type, p.reference_id, p.total_amount, p.method, 
+               p.payment_date, p.notes, p.created_at,
+               i.invoice_number, b.bill_number,
+               c.full_name as customer_name, s.name as supplier_name,
+               u.fullname as created_by_name
+        FROM payments p
+        LEFT JOIN invoices i ON i.id = p.invoice_id
+        LEFT JOIN bills b ON b.id = p.bill_id
+        LEFT JOIN customers c ON c.id = p.reference_id AND p.party_type = 'customer'
+        LEFT JOIN suppliers s ON s.id = p.reference_id AND p.party_type = 'supplier'
+        LEFT JOIN users u ON u.id = p.created_by
+        WHERE {where_clause}
+        ORDER BY p.payment_date DESC
+        LIMIT :limit OFFSET :offset
+    """)
+
+    result = await db.execute(query, params)
+
+    payments = []
+    for row in result:
+        payments.append({
+            "id": str(row[0]),
+            "party_type": row[1],
+            "reference_id": str(row[2]) if row[2] else None,
+            "amount": float(row[3]),
+            "method": row[4],
+            "payment_date": row[5].isoformat() if row[5] else None,
+            "notes": row[6],
+            "created_at": row[7].isoformat() if row[7] else None,
+            "invoice_number": row[8],
+            "bill_number": row[9],
+            "party_name": row[10] or row[11] or "Unknown",
+            "created_by": row[12]
+        })
+
+    count_result = await db.execute(
+        text(f"SELECT COUNT(*) FROM payments p WHERE {where_clause}"),
+        params
+    )
+    total = count_result.scalar() or 0
+
+    return {
+        "success": True,
+        "data": payments,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+
+# ============================================
+# BATCHES - List & Details
+# ============================================
+@app.get("/api/batches")
+async def get_batches(
+        pharmacy_id: str,
+        medicine_id: Optional[str] = None,
+        page: int = 1,
+        limit: int = 50,
+        db: AsyncSession = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    """Get batches with medicine info"""
+    offset = (page - 1) * limit
+
+    conditions = ["b.pharmacy_id = :pharmacy_id", "b.is_deleted = FALSE"]
+    params = {"pharmacy_id": UUID(pharmacy_id), "limit": limit, "offset": offset}
+
+    if medicine_id:
+        conditions.append("b.medicine_id = :medicine_id")
+        params["medicine_id"] = UUID(medicine_id)
+
+    where_clause = " AND ".join(conditions)
+
+    query = text(f"""
+        SELECT b.id, b.batch_number, b.expiry_date, b.purchase_price, b.selling_price,
+               b.quantity_received, b.quantity_remaining, b.created_at,
+               m.id as medicine_id, m.name as medicine_name, m.brand, m.strength,
+               bu.unit_type_id, ut.name as unit_type_name,
+               bu.pack_size, bu.subunit_size, bu.smallest_unit_factor
+        FROM batches b
+        JOIN medicines m ON m.id = b.medicine_id
+        LEFT JOIN batch_units bu ON bu.batch_id = b.id
+        LEFT JOIN unit_types ut ON ut.id = bu.unit_type_id
+        WHERE {where_clause}
+        ORDER BY b.created_at DESC
+        LIMIT :limit OFFSET :offset
+    """)
+
+    result = await db.execute(query, params)
+
+    batches = []
+    for row in result:
+        batches.append({
+            "id": str(row[0]),
+            "batch_number": row[1],
+            "expiry_date": row[2].isoformat() if row[2] else None,
+            "purchase_price": float(row[3]),
+            "selling_price": float(row[4]),
+            "quantity_received": row[5],
+            "quantity_remaining": row[6],
+            "created_at": row[7].isoformat() if row[7] else None,
+            "medicine": {
+                "id": str(row[8]),
+                "name": row[9],
+                "brand": row[10],
+                "strength": row[11]
+            },
+            "unit_info": {
+                "unit_type_id": str(row[12]) if row[12] else None,
+                "unit_name": row[13],
+                "pack_size": row[14],
+                "subunit_size": row[15],
+                "smallest_unit_factor": row[16]
+            } if row[12] else None
+        })
+
+    count_result = await db.execute(
+        text(f"SELECT COUNT(*) FROM batches b WHERE {where_clause}"),
+        params
+    )
+    total = count_result.scalar() or 0
+
+    return {
+        "success": True,
+        "data": batches,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+
+@app.get("/api/batches/{batch_id}")
+async def get_batch(
+        batch_id: str,
+        pharmacy_id: str,
+        db: AsyncSession = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    """Get single batch with all details"""
+    query = text("""
+        SELECT b.id, b.batch_number, b.expiry_date, b.purchase_price, b.selling_price,
+               b.quantity_received, b.quantity_remaining, b.created_at, b.updated_at,
+               m.id as medicine_id, m.name as medicine_name, m.brand, m.generic_name, m.strength,
+               bu.id as batch_unit_id, bu.unit_type_id, ut.name as unit_type_name,
+               bu.pack_size, bu.subunit_size, bu.smallest_unit_factor,
+               bu.purchase_price_per_unit, bu.selling_price_per_unit
+        FROM batches b
+        JOIN medicines m ON m.id = b.medicine_id
+        LEFT JOIN batch_units bu ON bu.batch_id = b.id
+        LEFT JOIN unit_types ut ON ut.id = bu.unit_type_id
+        WHERE b.id = :batch_id AND b.pharmacy_id = :pharmacy_id AND b.is_deleted = FALSE
+    """)
+
+    result = await db.execute(query, {
+        "batch_id": UUID(batch_id),
+        "pharmacy_id": UUID(pharmacy_id)
+    })
+    row = result.fetchone()
+
+    if not row:
+        return {"success": False, "error": "Batch not found"}
+
+    return {
+        "success": True,
+        "data": {
+            "id": str(row[0]),
+            "batch_number": row[1],
+            "expiry_date": row[2].isoformat() if row[2] else None,
+            "purchase_price": float(row[3]),
+            "selling_price": float(row[4]),
+            "quantity_received": row[5],
+            "quantity_remaining": row[6],
+            "created_at": row[7].isoformat() if row[7] else None,
+            "updated_at": row[8].isoformat() if row[8] else None,
+            "medicine": {
+                "id": str(row[9]),
+                "name": row[10],
+                "brand": row[11],
+                "generic_name": row[12],
+                "strength": row[13]
+            },
+            "unit_info": {
+                "id": str(row[14]) if row[14] else None,
+                "unit_type_id": str(row[15]) if row[15] else None,
+                "unit_name": row[16],
+                "pack_size": row[17],
+                "subunit_size": row[18],
+                "smallest_unit_factor": row[19],
+                "purchase_price_per_unit": float(row[20]) if row[20] else None,
+                "selling_price_per_unit": float(row[21]) if row[21] else None
+            } if row[14] else None
+        }
+    }
+
+
+# ============================================
+# UNIT TYPES - List
+# ============================================
+@app.get("/api/unit-types")
+async def get_unit_types(
+        pharmacy_id: Optional[str] = None,
+        db: AsyncSession = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    """Get all unit types (system and pharmacy-specific)"""
+    query = text("""
+        SELECT id, name, is_smallest_unit, is_system, created_at
+        FROM unit_types
+        WHERE is_deleted = FALSE
+        ORDER BY is_system DESC, name ASC
+    """)
+
+    result = await db.execute(query)
+
+    unit_types = []
+    for row in result:
+        unit_types.append({
+            "id": str(row[0]),
+            "name": row[1],
+            "is_smallest_unit": row[2],
+            "is_system": row[3],
+            "created_at": row[4].isoformat() if row[4] else None
+        })
+
+    return {"success": True, "data": unit_types}
+
+
+# ============================================
+# ACTIVITY LOGS - List
+# ============================================
+@app.get("/api/activity-logs")
+async def get_activity_logs(
+        pharmacy_id: str,
+        user_id: Optional[str] = None,
+        module: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page: int = 1,
+        limit: int = 50,
+        db: AsyncSession = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    """Get activity logs with filters"""
+    offset = (page - 1) * limit
+
+    conditions = ["pharmacy_id = :pharmacy_id"]
+    params = {"pharmacy_id": UUID(pharmacy_id), "limit": limit, "offset": offset}
+
+    if user_id:
+        conditions.append("user_id = :user_id")
+        params["user_id"] = UUID(user_id)
+    if module:
+        conditions.append("module = :module")
+        params["module"] = module
+    if start_date:
+        conditions.append("created_at >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        conditions.append("created_at <= :end_date")
+        params["end_date"] = end_date
+
+    where_clause = " AND ".join(conditions)
+
+    query = text(f"""
+        SELECT id, user_id, username, action, module, description, ip_address, created_at
+        FROM activity_logs
+        WHERE {where_clause}
+        ORDER BY created_at DESC
+        LIMIT :limit OFFSET :offset
+    """)
+
+    result = await db.execute(query, params)
+
+    logs = []
+    for row in result:
+        logs.append({
+            "id": str(row[0]),
+            "user_id": str(row[1]) if row[1] else None,
+            "username": row[2],
+            "action": row[3],
+            "module": row[4],
+            "description": row[5],
+            "ip_address": row[6],
+            "created_at": row[7].isoformat() if row[7] else None
+        })
+
+    count_result = await db.execute(
+        text(f"SELECT COUNT(*) FROM activity_logs WHERE {where_clause}"),
+        params
+    )
+    total = count_result.scalar() or 0
+
+    return {
+        "success": True,
+        "data": logs,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+
+# ============================================
+# INVENTORY LOGS - List
+# ============================================
+@app.get("/api/inventory-logs")
+async def get_inventory_logs(
+        pharmacy_id: str,
+        medicine_id: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        change_type: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page: int = 1,
+        limit: int = 50,
+        db: AsyncSession = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    """Get inventory logs with filters"""
+    offset = (page - 1) * limit
+
+    conditions = ["il.pharmacy_id = :pharmacy_id"]
+    params = {"pharmacy_id": UUID(pharmacy_id), "limit": limit, "offset": offset}
+
+    if medicine_id:
+        conditions.append("il.medicine_id = :medicine_id")
+        params["medicine_id"] = UUID(medicine_id)
+    if batch_id:
+        conditions.append("il.batch_id = :batch_id")
+        params["batch_id"] = UUID(batch_id)
+    if change_type:
+        conditions.append("il.change_type = :change_type")
+        params["change_type"] = change_type
+    if start_date:
+        conditions.append("il.created_at >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        conditions.append("il.created_at <= :end_date")
+        params["end_date"] = end_date
+
+    where_clause = " AND ".join(conditions)
+
+    query = text(f"""
+        SELECT il.id, il.reference_type, il.reference_id, il.change_type,
+               il.before_quantity, il.after_quantity, 
+               il.before_smallest_units, il.after_smallest_units,
+               il.created_at,
+               m.id as medicine_id, m.name as medicine_name,
+               b.batch_number,
+               u.fullname as created_by_name
+        FROM inventory_logs il
+        JOIN medicines m ON m.id = il.medicine_id
+        JOIN batches b ON b.id = il.batch_id
+        LEFT JOIN users u ON u.id = il.created_by
+        WHERE {where_clause}
+        ORDER BY il.created_at DESC
+        LIMIT :limit OFFSET :offset
+    """)
+
+    result = await db.execute(query, params)
+
+    logs = []
+    for row in result:
+        logs.append({
+            "id": str(row[0]),
+            "reference_type": row[1],
+            "reference_id": str(row[2]) if row[2] else None,
+            "change_type": row[3],
+            "before_quantity": row[4],
+            "after_quantity": row[5],
+            "before_smallest_units": row[6],
+            "after_smallest_units": row[7],
+            "created_at": row[8].isoformat() if row[8] else None,
+            "medicine": {
+                "id": str(row[9]),
+                "name": row[10]
+            },
+            "batch_number": row[11],
+            "created_by": row[12]
+        })
+
+    count_result = await db.execute(
+        text(f"SELECT COUNT(*) FROM inventory_logs il WHERE {where_clause}"),
+        params
+    )
+    total = count_result.scalar() or 0
+
+    return {
+        "success": True,
+        "data": logs,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ============================================
 # SYNC UPLOAD (Desktop pushes changes)
 # ============================================
@@ -2640,7 +3196,8 @@ async def sync_upload(
     print("=" * 60)
 
     # Skip triggers during sync to avoid infinite loops
-    await db.execute(text("SET app.skip_triggers = 'true'"))
+    # Use PostgreSQL's set_config for session-level variables
+    await db.execute(text("SELECT set_config('app.skip_triggers', 'true', TRUE)"))
 
     processed = 0
     conflicts = 0
@@ -2862,7 +3419,7 @@ async def sync_upload(
                         print(f"   → Calling insert_record for {table_name}")
                         print(f"   New data: {new_data}")
                         try:
-                            await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
+                            await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id, local_id)
                             processed += 1
                             print(f"   ✅ INSERT successful for {table_name}")
                         except Exception as insert_error:
@@ -2873,7 +3430,8 @@ async def sync_upload(
                     elif not existing_row and operation == "UPDATE":
                         # Record doesn't exist - treat as INSERT
                         print(f"   ⚠️ Record not found for UPDATE, treating as INSERT")
-                        await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
+                        await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id,
+                                            local_id)
                         processed += 1
 
             except Exception as e:
@@ -2908,9 +3466,10 @@ async def sync_upload(
         import traceback
         traceback.print_exc()
 
+
     finally:
-        # Re-enable triggers
-        await db.execute(text("SET app.skip_triggers = 'false'"))
+        # Re-enable triggers - clear the session variable
+        await db.execute(text("SELECT set_config('app.skip_triggers', 'false', TRUE)"))
         print("=" * 60)
 
     return SyncUploadResponse(
@@ -3175,22 +3734,46 @@ async def update_record(db: AsyncSession, table_name: str, record_id: UUID, data
 
 
 async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data: dict,
-                        updated_at: datetime, pharmacy_id: UUID):
-    """Insert new record with proper column mapping and FK UUID resolution"""
+                        updated_at: datetime, pharmacy_id: UUID, local_id: int = None):
+    """Insert new record with proper UUID resolution and FK mapping"""
 
-    # Remove fields that shouldn't be inserted
+    # ========== SECURITY: Whitelist table name ==========
+    if table_name not in ALLOWED_SYNC_TABLES:
+        print(f"   ❌ REJECTED: Table '{table_name}' not in whitelist")
+        raise ValueError(f"Table '{table_name}' is not allowed for sync operations")
+
+    # Remove fields that shouldn't be inserted directly
     data.pop("id", None)
     data.pop("pharmacy_id", None)
     data.pop("created_at", None)
-    data.pop("customer_id", None)  # SQLite field, not in PostgreSQL
-    data.pop("medicine_id", None)  # SQLite field, not in PostgreSQL
 
-    # Extract cloud_uuid if present - we'll use it as the id
-    cloud_uuid = data.pop("cloud_uuid", None)
-    actual_id = UUID(cloud_uuid) if cloud_uuid else record_id
+    # The record_id passed in should be the cloud_uuid (from mapping or newly generated)
+    actual_id = record_id
+
+    print(f"   📝 Inserting into {table_name} with ID: {actual_id}")
+
+    # ========== SAVE ID MAPPING (if local_id provided) ==========
+    if local_id is not None:
+        print(f"   💾 Saving id_mapping: {table_name} local_id={local_id} -> {actual_id}")
+        await db.execute(
+            text("""
+                INSERT INTO id_mapping (pharmacy_id, table_name, local_id, cloud_uuid)
+                VALUES (:pharmacy_id, :table_name, :local_id, :cloud_uuid)
+                ON CONFLICT (pharmacy_id, table_name, local_id) 
+                DO UPDATE SET cloud_uuid = :cloud_uuid, updated_at = CURRENT_TIMESTAMP
+            """),
+            {
+                "pharmacy_id": pharmacy_id,
+                "table_name": table_name,
+                "local_id": local_id,
+                "cloud_uuid": actual_id
+            }
+        )
 
     # ========== FK UUID RESOLUTION ==========
     fk_mappings = {
+        'pharmacy_id': 'pharmacies',
+        'role_id': 'roles',
         'category_id': 'categories',
         'medicine_id': 'medicines',
         'customer_id': 'customers',
@@ -3198,26 +3781,44 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
         'batch_id': 'batches',
         'invoice_id': 'invoices',
         'bill_id': 'bills',
-        'purchase_unit_id': 'unit_types',
         'unit_type_id': 'unit_types',
+        'purchase_unit_id': 'unit_types',
         'return_id': 'customer_returns',
         'payment_id': 'payments',
         'user_id': 'users',
-        'role_id': 'roles'
+        'created_by': 'users',
+        'reference_id': None  # Special handling based on reference_type
     }
 
     for fk_field, fk_table in fk_mappings.items():
         if fk_field in data and data[fk_field] is not None and data[fk_field] != "":
             local_fk_value = data[fk_field]
 
-            # Check if it's already a UUID (36 chars with hyphens)
+            # Skip if it's already a valid UUID
             if isinstance(local_fk_value, str) and len(local_fk_value) == 36 and '-' in local_fk_value:
-                # Already a UUID, keep as is
-                continue
+                try:
+                    UUID(local_fk_value)
+                    continue  # Already a valid UUID
+                except ValueError:
+                    pass  # Not a UUID, needs mapping
 
             # Try to convert to int (local INTEGER ID)
             try:
-                local_id = int(local_fk_value)
+                local_id_val = int(local_fk_value)
+
+                # Special handling for reference_id which needs reference_type
+                if fk_field == 'reference_id' and 'party_type' in data:
+                    if data['party_type'] == 'customer':
+                        fk_table = 'customers'
+                    elif data['party_type'] == 'supplier':
+                        fk_table = 'suppliers'
+                    elif data['party_type'] == 'invoice':
+                        fk_table = 'invoices'
+                    else:
+                        data[fk_field] = None
+                        continue
+                elif fk_table is None:
+                    continue  # Skip if we can't determine the table
 
                 # Look up cloud UUID from id_mapping
                 mapping_result = await db.execute(
@@ -3230,21 +3831,22 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
                     {
                         "pharmacy_id": pharmacy_id,
                         "table_name": fk_table,
-                        "local_id": local_id
+                        "local_id": local_id_val
                     }
                 )
                 mapping_row = mapping_result.fetchone()
                 if mapping_row:
-                    data[fk_field] = mapping_row[0]  # Replace with cloud UUID
-                    print(f"   ✅ Mapped {fk_field}: {local_id} -> {mapping_row[0]}")
+                    data[fk_field] = str(mapping_row[0])
+                    print(f"   ✅ Mapped FK {fk_field}: {local_id_val} -> {mapping_row[0]}")
                 else:
-                    print(f"   ⚠️ {fk_field}={local_id} not found in id_mapping for {fk_table}")
-                    data[fk_field] = None  # Set to NULL if mapping not found
+                    print(f"   ⚠️ FK {fk_field}={local_id_val} not found in id_mapping for {fk_table}")
+                    # CRITICAL: Set to NULL if mapping not found to avoid FK violation
+                    data[fk_field] = None
             except (ValueError, TypeError):
-                # Not an integer, leave as is (might be UUID already)
+                # Not an integer, leave as is (might be UUID string already)
                 pass
 
-    # Base insert data
+    # ========== BUILD INSERT DATA ==========
     insert_data = {
         "id": actual_id,
         "pharmacy_id": pharmacy_id,
@@ -3253,17 +3855,20 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
         "source": "desktop"
     }
 
-    # Map SQLite field names to PostgreSQL field names
+    # Field mapping from SQLite to PostgreSQL
     field_mapping = {
         'full_name': 'full_name',
+        'fullname': 'fullname',
+        'name': 'name',
+        'description': 'description',
         'phone': 'phone',
+        'email': 'email',
         'address': 'address',
         'balance': 'balance',
         'credit_limit': 'credit_limit',
         'total_purchases': 'total_purchases',
         'total_payments': 'total_payments',
         'last_payment_date': 'last_payment_date',
-        'name': 'name',
         'brand': 'brand',
         'generic_name': 'generic_name',
         'strength': 'strength',
@@ -3276,6 +3881,7 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
         'quantity_received': 'quantity_received',
         'quantity_remaining': 'quantity_remaining',
         'invoice_number': 'invoice_number',
+        'invoice_date': 'invoice_date',
         'total_amount': 'total_amount',
         'discount': 'discount',
         'net_amount': 'net_amount',
@@ -3284,102 +3890,134 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
         'amount_paid': 'amount_paid',
         'balance_due': 'balance_due',
         'due_date': 'due_date',
-        'created_by': 'created_by',
-        'category_id': 'category_id',
-        'purchase_unit_id': 'purchase_unit_id',
         'pack_size': 'pack_size',
         'subunit_size': 'subunit_size',
         'smallest_unit_factor': 'smallest_unit_factor',
         'is_default': 'is_default',
-        'unit_type_id': 'unit_type_id',
         'return_date': 'return_date',
-        'total_amount': 'total_amount',
         'reason': 'reason',
         'party_type': 'party_type',
-        'reference_id': 'reference_id',
         'method': 'method',
         'payment_date': 'payment_date',
         'notes': 'notes',
         'quantity': 'quantity',
         'unit_price': 'unit_price',
-        'description': 'description'
+        'unit_quantity': 'unit_quantity',
+        'permissions': 'permissions',
+        'is_active': 'is_active',
+        'is_verified': 'is_verified',
+        'is_deleted': 'is_deleted',
+        'deleted_at': 'deleted_at',
+        'username': 'username',
+        'password_hash': 'password_hash',
+        'owner_name': 'owner_name',
+        'city': 'city',
+        'province': 'province',
+        'subscription_type': 'subscription_type',
+        'subscription_expiry': 'subscription_expiry',
+        'hwid': 'hwid',
+        'contact_person': 'contact_person',
+        'before_quantity': 'before_quantity',
+        'after_quantity': 'after_quantity',
+        'before_smallest_units': 'before_smallest_units',
+        'after_smallest_units': 'after_smallest_units',
+        'change_type': 'change_type',
+        'reference_type': 'reference_type',
+        'action': 'action',
+        'module': 'module',
+        'ip_address': 'ip_address',
+        'purchase_price_per_unit': 'purchase_price_per_unit',
+        'selling_price_per_unit': 'selling_price_per_unit',
+        'is_smallest_unit': 'is_smallest_unit',
+        'is_system': 'is_system'
     }
 
     # Add mapped fields
     for key, value in data.items():
         if value is not None and value != "":
             pg_key = field_mapping.get(key, key)
-            if pg_key in ['full_name', 'phone', 'address', 'name', 'brand', 'generic_name',
-                          'strength', 'dosage_form', 'barcode', 'batch_number', 'invoice_number',
-                          'status', 'balance', 'credit_limit', 'total_purchases', 'total_payments',
-                          'purchase_price', 'selling_price', 'quantity_received', 'quantity_remaining',
-                          'total_amount', 'discount', 'net_amount', 'amount_paid', 'balance_due',
-                          'category_id', 'purchase_unit_id', 'pack_size', 'subunit_size',
-                          'smallest_unit_factor', 'is_default', 'unit_type_id', 'return_date',
-                          'reason', 'party_type', 'method', 'payment_date', 'notes', 'quantity',
-                          'unit_price', 'description']:
-                insert_data[pg_key] = value
-            elif pg_key == 'expiry_date' or pg_key == 'last_payment_date' or pg_key == 'due_date' or pg_key == 'return_date' or pg_key == 'payment_date':
+
+            # Handle date/time fields
+            if pg_key in ['expiry_date', 'last_payment_date', 'due_date', 'return_date',
+                          'payment_date', 'invoice_date', 'bill_date', 'deleted_at',
+                          'subscription_expiry']:
                 if isinstance(value, str):
                     try:
-                        insert_data[pg_key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                        # Handle ISO format with or without timezone
+                        clean_value = value.replace('Z', '+00:00')
+                        insert_data[pg_key] = datetime.fromisoformat(clean_value)
+                    except:
+                        pass
+                elif isinstance(value, datetime):
+                    insert_data[pg_key] = value
+
+            # Handle JSON fields
+            elif pg_key == 'permissions':
+                if isinstance(value, str):
+                    try:
+                        insert_data[pg_key] = json.loads(value)
                     except:
                         insert_data[pg_key] = value
                 else:
                     insert_data[pg_key] = value
-            elif pg_key == 'created_by' or pg_key == 'reference_id':
-                try:
-                    if isinstance(value, str) and len(value) == 36:
-                        insert_data[pg_key] = UUID(value)
-                    elif value is not None:
-                        # Try to map from id_mapping
-                        pass
-                except:
-                    pass
 
-    # Build and execute insert for main table
+            # Handle numeric/decimal fields
+            elif pg_key in ['balance', 'credit_limit', 'total_purchases', 'total_payments',
+                            'purchase_price', 'selling_price', 'total_amount', 'discount',
+                            'net_amount', 'amount_paid', 'balance_due', 'unit_price',
+                            'purchase_price_per_unit', 'selling_price_per_unit']:
+                try:
+                    insert_data[pg_key] = float(value) if value is not None else 0
+                except (ValueError, TypeError):
+                    insert_data[pg_key] = 0
+
+            # Handle integer fields
+            elif pg_key in ['quantity_received', 'quantity_remaining', 'quantity',
+                            'unit_quantity', 'pack_size', 'subunit_size', 'smallest_unit_factor',
+                            'sync_version']:
+                try:
+                    insert_data[pg_key] = int(value) if value is not None else 0
+                except (ValueError, TypeError):
+                    insert_data[pg_key] = 0
+
+            # Handle boolean fields
+            elif pg_key in ['is_credit', 'is_default', 'is_active', 'is_verified',
+                            'is_deleted', 'is_smallest_unit', 'is_system']:
+                if isinstance(value, bool):
+                    insert_data[pg_key] = value
+                elif isinstance(value, int):
+                    insert_data[pg_key] = bool(value)
+                elif isinstance(value, str):
+                    insert_data[pg_key] = value.lower() in ('true', '1', 'yes')
+
+            # Handle UUID fields (already resolved above)
+            elif pg_key in fk_mappings.keys():
+                if value is not None:
+                    try:
+                        insert_data[pg_key] = UUID(value) if isinstance(value, str) else value
+                    except (ValueError, TypeError):
+                        insert_data[pg_key] = None
+
+            # Default: string fields
+            else:
+                insert_data[pg_key] = str(value)[:255] if value else None
+
+    # ========== EXECUTE INSERT ==========
     columns = list(insert_data.keys())
     placeholders = [f":{col}" for col in columns]
 
     query = text(f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})")
 
     try:
-        print(f"   📝 Inserting into {table_name}: {columns}")
+        print(f"   📝 Executing INSERT with {len(columns)} columns")
         await db.execute(query, insert_data)
         print(f"   ✅ INSERT successful for {table_name}")
 
-        # ========== Handle batch_units when inserting a batch ==========
+        # ========== HANDLE BATCH_UNITS CREATION ==========
         if table_name == 'batches':
             unit_type_id = data.get('unit_type_id')
-            pack_size = data.get('pack_size')
-            subunit_size = data.get('subunit_size')
-            smallest_unit_factor = data.get('smallest_unit_factor', 1)
 
             if unit_type_id:
-                try:
-                    unit_type_uuid = UUID(unit_type_id) if isinstance(unit_type_id, str) else unit_type_id
-                except:
-                    unit_name = str(unit_type_id)
-                    unit_result = await db.execute(
-                        text("""
-                            SELECT id FROM unit_types 
-                            WHERE name = :name AND (is_system = TRUE OR pharmacy_id = :pharmacy_id)
-                        """),
-                        {"name": unit_name, "pharmacy_id": pharmacy_id}
-                    )
-                    unit_row = unit_result.fetchone()
-                    if unit_row:
-                        unit_type_uuid = unit_row[0]
-                    else:
-                        unit_type_uuid = uuid.uuid4()
-                        await db.execute(
-                            text("""
-                                INSERT INTO unit_types (id, pharmacy_id, name, is_smallest_unit, is_system, source)
-                                VALUES (:id, :pharmacy_id, :name, FALSE, FALSE, 'desktop')
-                            """),
-                            {"id": unit_type_uuid, "pharmacy_id": pharmacy_id, "name": unit_name}
-                        )
-
                 batch_unit_id = uuid.uuid4()
                 await db.execute(
                     text("""
@@ -3393,15 +4031,16 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
                             :subunit_size, :smallest_unit_factor, :purchase_price, 
                             :selling_price, 'desktop'
                         )
+                        ON CONFLICT (batch_id) DO NOTHING
                     """),
                     {
                         "id": batch_unit_id,
                         "pharmacy_id": pharmacy_id,
                         "batch_id": actual_id,
-                        "unit_type_id": unit_type_uuid,
-                        "pack_size": pack_size if pack_size else None,
-                        "subunit_size": subunit_size if subunit_size else None,
-                        "smallest_unit_factor": smallest_unit_factor,
+                        "unit_type_id": UUID(unit_type_id) if isinstance(unit_type_id, str) else unit_type_id,
+                        "pack_size": data.get('pack_size'),
+                        "subunit_size": data.get('subunit_size'),
+                        "smallest_unit_factor": data.get('smallest_unit_factor', 1),
                         "purchase_price": data.get('purchase_price', 0),
                         "selling_price": data.get('selling_price', 0)
                     }
@@ -3411,9 +4050,7 @@ async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data
     except Exception as e:
         print(f"   ❌ Insert error for {table_name}: {e}")
         print(f"   Columns: {columns}")
-        print(f"   Data keys: {list(insert_data.keys())}")
         raise
-
 ## Unit Types mapping endpoint
 @app.post("/api/unit-types/map")
 async def map_unit_type(

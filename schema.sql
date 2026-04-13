@@ -1,4 +1,5 @@
 
+
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -729,7 +730,7 @@ CREATE TABLE id_mapping (
 
 CREATE INDEX idx_id_mapping_pharmacy ON id_mapping(pharmacy_id);
 CREATE INDEX idx_id_mapping_lookup ON id_mapping(pharmacy_id, table_name, local_id);
-
+CREATE INDEX idx_id_mapping_cloud ON id_mapping(cloud_uuid);
 
 
 
@@ -839,3 +840,85 @@ INSERT INTO unit_types (id, name, is_smallest_unit, is_system, created_at) VALUE
 
 -- Create index for system units
 CREATE INDEX IF NOT EXISTS idx_unit_types_system ON unit_types(is_system);
+
+select * from customers;
+
+
+
+
+
+
+
+-- Conflict Log Table
+CREATE TABLE conflict_log (
+    id BIGSERIAL PRIMARY KEY,
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    table_name VARCHAR(50) NOT NULL,
+    record_id UUID NOT NULL,
+    conflict_type VARCHAR(20) NOT NULL, -- 'insert_conflict', 'update_conflict'
+    desktop_data JSONB,
+    cloud_data JSONB,
+    winner VARCHAR(20) NOT NULL, -- 'desktop' or 'cloud'
+    desktop_updated_at TIMESTAMP,
+    cloud_updated_at TIMESTAMP,
+    resolution_reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_conflict_log_pharmacy ON conflict_log(pharmacy_id);
+CREATE INDEX idx_conflict_log_created ON conflict_log(created_at);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- Create the get_pending_changes function
+CREATE OR REPLACE FUNCTION get_pending_changes(p_pharmacy_id UUID, p_since_version BIGINT)
+RETURNS TABLE(
+    table_name VARCHAR,
+    record_id UUID,
+    operation VARCHAR,
+    new_data JSONB,
+    sync_version INTEGER,
+    changed_at TIMESTAMP
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        cl.table_name,
+        cl.record_id,
+        cl.operation,
+        cl.new_data,
+        cl.sync_version,
+        cl.changed_at
+    FROM change_log cl
+    WHERE cl.pharmacy_id = p_pharmacy_id
+        AND cl.sync_version > p_since_version
+        AND cl.synced_to_cloud = FALSE
+    ORDER BY cl.sync_version ASC
+    LIMIT 100;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create the mark_changes_synced function
+CREATE OR REPLACE FUNCTION mark_changes_synced(p_change_ids BIGINT[])
+RETURNS VOID AS $$
+BEGIN
+    UPDATE change_log
+    SET synced_to_cloud = TRUE,
+        synced_at = CURRENT_TIMESTAMP
+    WHERE id = ANY(p_change_ids);
+END;
+$$ LANGUAGE plpgsql;
