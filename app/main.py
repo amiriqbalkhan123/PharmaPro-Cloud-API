@@ -2869,6 +2869,13 @@ async def sync_upload(
                             print(f"   ❌ INSERT failed in insert_record: {str(insert_error)}")
                             raise
 
+                        # ✅ ADD THIS NEW SECTION:
+                    elif not existing_row and operation == "UPDATE":
+                        # Record doesn't exist - treat as INSERT
+                        print(f"   ⚠️ Record not found for UPDATE, treating as INSERT")
+                        await insert_record(db, table_name, record_id, new_data, updated_at, request.pharmacy_id)
+                        processed += 1
+
             except Exception as e:
                 error_msg = f"Error processing {change.get('table_name')}/{change.get('record_id')}: {str(e)}"
                 print(f"   ❌ ERROR: {error_msg}")
