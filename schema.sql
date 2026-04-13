@@ -587,10 +587,11 @@ CREATE TABLE IF NOT EXISTS supplier_return_details (
 
 -- 1. First, add default value for sync_version if not exists
 ALTER TABLE customers ALTER COLUMN sync_version SET DEFAULT 1;
+
 -- Drop existing function
 DROP FUNCTION IF EXISTS log_table_changes() CASCADE;
 
--- Create updated function with skip-trigger flag
+-- Create updated function with proper skip-trigger flag
 CREATE OR REPLACE FUNCTION log_table_changes()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -602,9 +603,9 @@ DECLARE
 BEGIN
     -- Check if triggers should be skipped (during sync operations)
     BEGIN
-        skip_triggers := current_setting('app.skip_triggers', true)::boolean;
+        skip_triggers := COALESCE(current_setting('app.skip_triggers', TRUE)::boolean, FALSE);
     EXCEPTION WHEN OTHERS THEN
-        skip_triggers := false;
+        skip_triggers := FALSE;
     END;
     
     IF skip_triggers THEN
@@ -922,3 +923,6 @@ BEGIN
     WHERE id = ANY(p_change_ids);
 END;
 $$ LANGUAGE plpgsql;
+
+
+
