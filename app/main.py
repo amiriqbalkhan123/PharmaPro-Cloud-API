@@ -242,6 +242,8 @@ async def map_desktop_fks_to_cloud_uuids(
         try:
             local_id_val = int(raw_value)
         except Exception:
+            # Invalid non-UUID and non-int FK -> drop it
+            data.pop(fk_field, None)
             continue
 
         resolved_table = fk_table
@@ -271,6 +273,7 @@ async def map_desktop_fks_to_cloud_uuids(
                 resolved_table = None
 
         if not resolved_table:
+            data.pop(fk_field, None)
             continue
 
         mapped_uuid = await resolve_local_id_to_cloud_uuid(
@@ -282,6 +285,9 @@ async def map_desktop_fks_to_cloud_uuids(
 
         if mapped_uuid:
             data[fk_field] = mapped_uuid
+        else:
+            # If local integer FK can't be mapped to a cloud UUID, drop it
+            data.pop(fk_field, None)
 
     return data
 
@@ -304,17 +310,20 @@ async def get_existing_record(
 ):
     table_name = normalize_sync_table_name(table_name)
     has_pharmacy_id = await table_has_column(db, table_name, "pharmacy_id")
+    has_updated_at = await table_has_column(db, table_name, "updated_at")
+
+    select_updated_at = ", updated_at" if has_updated_at else ", NULL as updated_at"
 
     if has_pharmacy_id and pharmacy_id is not None:
         query = text(f"""
-            SELECT id, updated_at
+            SELECT id {select_updated_at}
             FROM {table_name}
             WHERE id = :record_id AND pharmacy_id = :pharmacy_id
         """)
         result = await db.execute(query, {"record_id": record_id, "pharmacy_id": pharmacy_id})
     else:
         query = text(f"""
-            SELECT id, updated_at
+            SELECT id {select_updated_at}
             FROM {table_name}
             WHERE id = :record_id
         """)
