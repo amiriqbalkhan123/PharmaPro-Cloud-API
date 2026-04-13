@@ -4631,6 +4631,14 @@ async def startup_event():
                     await db.commit()
                     print("✅ Sync system user created")
 
+
+@app.get("/api/debug/route-check")
+async def debug_route_check():
+    return {
+        "message": "THIS IS THE UPDATED MAIN.PY",
+        "has_pharmacy_token_route": True
+    }
+
 if __name__ == "__main__":
     import uvicorn
 

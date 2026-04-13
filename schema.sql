@@ -1,11 +1,204 @@
+BEGIN;
 
-
--- Enable UUID extension
+-- =========================================================
+-- EXTENSIONS
+-- =========================================================
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- ============================================
+-- =========================================================
+-- CORE FUNCTIONS
+-- =========================================================
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION log_table_changes()
+RETURNS TRIGGER AS $$
+DECLARE
+    old_data_json JSONB;
+    new_data_json JSONB;
+    changed_fields_arr TEXT[];
+    current_sync_ver INTEGER;
+    skip_triggers BOOLEAN := FALSE;
+
+    v_pharmacy_id UUID;
+    v_record_id UUID;
+    v_changed_by UUID;
+    ref_uuid UUID;
+BEGIN
+    BEGIN
+        skip_triggers := COALESCE(current_setting('app.skip_triggers', TRUE)::boolean, FALSE);
+    EXCEPTION WHEN OTHERS THEN
+        skip_triggers := FALSE;
+    END;
+
+    IF skip_triggers THEN
+        IF TG_OP IN ('INSERT', 'UPDATE') THEN
+            RETURN NEW;
+        ELSE
+            RETURN OLD;
+        END IF;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        old_data_json := to_jsonb(OLD);
+        new_data_json := NULL;
+        changed_fields_arr := ARRAY['*'];
+        v_record_id := OLD.id;
+        v_changed_by := NULLIF(old_data_json->>'created_by', '')::UUID;
+        v_pharmacy_id := NULLIF(old_data_json->>'pharmacy_id', '')::UUID;
+        current_sync_ver := COALESCE(OLD.sync_version, 0) + 1;
+    ELSIF TG_OP = 'INSERT' THEN
+        old_data_json := NULL;
+        new_data_json := to_jsonb(NEW);
+        changed_fields_arr := ARRAY['*'];
+        v_record_id := NEW.id;
+        v_changed_by := NULLIF(new_data_json->>'created_by', '')::UUID;
+        v_pharmacy_id := NULLIF(new_data_json->>'pharmacy_id', '')::UUID;
+        NEW.sync_version := 1;
+        current_sync_ver := 1;
+    ELSIF TG_OP = 'UPDATE' THEN
+        old_data_json := to_jsonb(OLD);
+        new_data_json := to_jsonb(NEW);
+
+        SELECT array_agg(key)
+        INTO changed_fields_arr
+        FROM jsonb_each(to_jsonb(NEW))
+        WHERE jsonb_each.value IS DISTINCT FROM (to_jsonb(OLD)->key);
+
+        IF changed_fields_arr IS NULL THEN
+            changed_fields_arr := ARRAY[]::TEXT[];
+        END IF;
+
+        v_record_id := NEW.id;
+        v_changed_by := NULLIF(new_data_json->>'created_by', '')::UUID;
+        v_pharmacy_id := NULLIF(new_data_json->>'pharmacy_id', '')::UUID;
+
+        current_sync_ver := COALESCE(OLD.sync_version, 0) + 1;
+        NEW.sync_version := current_sync_ver;
+    END IF;
+
+    -- Derive pharmacy_id for detail tables that don't store it directly
+    IF v_pharmacy_id IS NULL THEN
+        IF TG_TABLE_NAME = 'invoice_details' THEN
+            ref_uuid := COALESCE(NULLIF((COALESCE(new_data_json, old_data_json)->>'invoice_id'), '')::UUID, NULL);
+            IF ref_uuid IS NOT NULL THEN
+                SELECT pharmacy_id INTO v_pharmacy_id FROM invoices WHERE id = ref_uuid;
+            END IF;
+
+        ELSIF TG_TABLE_NAME = 'bill_details' THEN
+            ref_uuid := COALESCE(NULLIF((COALESCE(new_data_json, old_data_json)->>'bill_id'), '')::UUID, NULL);
+            IF ref_uuid IS NOT NULL THEN
+                SELECT pharmacy_id INTO v_pharmacy_id FROM bills WHERE id = ref_uuid;
+            END IF;
+
+        ELSIF TG_TABLE_NAME = 'customer_return_details' THEN
+            ref_uuid := COALESCE(NULLIF((COALESCE(new_data_json, old_data_json)->>'return_id'), '')::UUID, NULL);
+            IF ref_uuid IS NOT NULL THEN
+                SELECT pharmacy_id INTO v_pharmacy_id FROM customer_returns WHERE id = ref_uuid;
+            END IF;
+
+        ELSIF TG_TABLE_NAME = 'supplier_return_details' THEN
+            ref_uuid := COALESCE(NULLIF((COALESCE(new_data_json, old_data_json)->>'return_id'), '')::UUID, NULL);
+            IF ref_uuid IS NOT NULL THEN
+                SELECT pharmacy_id INTO v_pharmacy_id FROM supplier_returns WHERE id = ref_uuid;
+            END IF;
+        END IF;
+    END IF;
+
+    -- Skip change log insert if no pharmacy context is available
+    -- This allows global/system unit_types to exist without polluting change_log
+    IF v_pharmacy_id IS NOT NULL THEN
+        INSERT INTO change_log (
+            table_name,
+            record_id,
+            pharmacy_id,
+            operation,
+            old_data,
+            new_data,
+            changed_fields,
+            sync_version,
+            synced_to_cloud,
+            changed_by,
+            source
+        )
+        VALUES (
+            TG_TABLE_NAME,
+            v_record_id,
+            v_pharmacy_id,
+            TG_OP,
+            old_data_json,
+            new_data_json,
+            changed_fields_arr,
+            current_sync_ver,
+            FALSE,
+            v_changed_by,
+            COALESCE(COALESCE(new_data_json, old_data_json)->>'source', 'desktop')
+        );
+    END IF;
+
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        RETURN NEW;
+    ELSE
+        RETURN OLD;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION get_pending_changes(
+    p_pharmacy_id UUID,
+    p_since_version BIGINT
+)
+RETURNS TABLE(
+    id BIGINT,
+    table_name VARCHAR,
+    record_id UUID,
+    operation VARCHAR,
+    new_data JSONB,
+    sync_version INTEGER,
+    changed_at TIMESTAMP
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        cl.id,
+        cl.table_name,
+        cl.record_id,
+        cl.operation,
+        cl.new_data,
+        cl.sync_version,
+        cl.changed_at
+    FROM change_log cl
+    WHERE cl.pharmacy_id = p_pharmacy_id
+      AND cl.sync_version > p_since_version
+    ORDER BY cl.sync_version ASC, cl.id ASC;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION mark_changes_synced(p_change_ids BIGINT[])
+RETURNS VOID AS $$
+BEGIN
+    UPDATE change_log
+    SET synced_to_cloud = TRUE,
+        synced_at = CURRENT_TIMESTAMP
+    WHERE id = ANY(p_change_ids);
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- =========================================================
+-- TABLES
+-- =========================================================
+
 -- 1. PHARMACIES
--- ============================================
 CREATE TABLE pharmacies (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(100) NOT NULL,
@@ -25,17 +218,16 @@ CREATE TABLE pharmacies (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- ============================================
--- 2. ROLES & USERS
--- ============================================
+-- 2. ROLES
 CREATE TABLE roles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(50) NOT NULL UNIQUE,
     description TEXT,
-    permissions JSONB DEFAULT '{}',
+    permissions JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 3. USERS
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -55,9 +247,22 @@ CREATE TABLE users (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 3. CUSTOMERS
--- ============================================
+-- 4. CATEGORIES
+CREATE TABLE categories (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    name VARCHAR(50) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    sync_version INTEGER DEFAULT 1,
+    source VARCHAR(20) DEFAULT 'desktop',
+    created_by UUID REFERENCES users(id),
+    UNIQUE (pharmacy_id, name)
+);
+
+-- 5. CUSTOMERS
 CREATE TABLE customers (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -77,9 +282,7 @@ CREATE TABLE customers (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 4. SUPPLIERS
--- ============================================
+-- 6. SUPPLIERS
 CREATE TABLE suppliers (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -100,27 +303,26 @@ CREATE TABLE suppliers (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 5. UNIT TYPES
--- ============================================
+-- 7. UNIT TYPES
 CREATE TABLE unit_types (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    pharmacy_id UUID REFERENCES pharmacies(id) ON DELETE CASCADE,
     name VARCHAR(50) NOT NULL,
     is_smallest_unit BOOLEAN DEFAULT FALSE,
+    is_system BOOLEAN DEFAULT FALSE,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted BOOLEAN DEFAULT FALSE,
     sync_version INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(pharmacy_id, name)
+    created_by UUID REFERENCES users(id),
+    UNIQUE (pharmacy_id, name)
 );
 
--- ============================================
--- 6. MEDICINES
--- ============================================
+-- 8. MEDICINES
 CREATE TABLE medicines (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    category_id UUID REFERENCES categories(id),
     name VARCHAR(100) NOT NULL,
     generic_name VARCHAR(100),
     brand VARCHAR(100),
@@ -147,9 +349,7 @@ CREATE TABLE medicines (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 7. BATCHES
--- ============================================
+-- 9. BATCHES
 CREATE TABLE batches (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -160,10 +360,6 @@ CREATE TABLE batches (
     selling_price DECIMAL(10,2) NOT NULL,
     quantity_received INTEGER NOT NULL,
     quantity_remaining INTEGER NOT NULL,
-    unit_type_id UUID REFERENCES unit_types(id),
-    pack_size INTEGER,
-    subunit_size INTEGER,
-    smallest_unit_factor INTEGER DEFAULT 1,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted BOOLEAN DEFAULT FALSE,
     sync_version INTEGER DEFAULT 1,
@@ -173,9 +369,44 @@ CREATE TABLE batches (
     UNIQUE(pharmacy_id, medicine_id, batch_number)
 );
 
--- ============================================
--- 8. INVOICES (SALES)
--- ============================================
+-- 10. BATCH UNITS
+CREATE TABLE batch_units (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    batch_id UUID NOT NULL UNIQUE REFERENCES batches(id) ON DELETE CASCADE,
+    unit_type_id UUID NOT NULL REFERENCES unit_types(id),
+    pack_size INTEGER,
+    subunit_size INTEGER,
+    smallest_unit_factor INTEGER NOT NULL DEFAULT 1,
+    purchase_price_per_unit DECIMAL(10,2) NOT NULL,
+    selling_price_per_unit DECIMAL(10,2) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    sync_version INTEGER DEFAULT 1,
+    source VARCHAR(20) DEFAULT 'desktop',
+    created_by UUID REFERENCES users(id)
+);
+
+-- 11. MEDICINE PACKAGING TEMPLATES
+CREATE TABLE medicine_packaging_templates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    medicine_id UUID NOT NULL REFERENCES medicines(id) ON DELETE CASCADE,
+    purchase_unit_id UUID NOT NULL REFERENCES unit_types(id),
+    pack_size INTEGER,
+    subunit_size INTEGER,
+    smallest_unit_factor INTEGER NOT NULL DEFAULT 1,
+    is_default BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    sync_version INTEGER DEFAULT 1,
+    source VARCHAR(20) DEFAULT 'desktop',
+    created_by UUID REFERENCES users(id)
+);
+
+-- 12. INVOICES
 CREATE TABLE invoices (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -198,9 +429,7 @@ CREATE TABLE invoices (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 9. INVOICE DETAILS
--- ============================================
+-- 13. INVOICE DETAILS
 CREATE TABLE invoice_details (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
@@ -212,12 +441,11 @@ CREATE TABLE invoice_details (
     discount DECIMAL(10,2) DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted BOOLEAN DEFAULT FALSE,
-    sync_version INTEGER DEFAULT 1
+    sync_version INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- ============================================
--- 10. BILLS (PURCHASES)
--- ============================================
+-- 14. BILLS
 CREATE TABLE bills (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -240,9 +468,7 @@ CREATE TABLE bills (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 11. BILL DETAILS
--- ============================================
+-- 15. BILL DETAILS
 CREATE TABLE bill_details (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     bill_id UUID NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
@@ -259,12 +485,11 @@ CREATE TABLE bill_details (
     smallest_unit_factor INTEGER DEFAULT 1,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     is_deleted BOOLEAN DEFAULT FALSE,
-    sync_version INTEGER DEFAULT 1
+    sync_version INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- ============================================
--- 12. CUSTOMER RETURNS
--- ============================================
+-- 16. CUSTOMER RETURNS
 CREATE TABLE customer_returns (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -281,9 +506,20 @@ CREATE TABLE customer_returns (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 13. SUPPLIER RETURNS
--- ============================================
+-- 17. CUSTOMER RETURN DETAILS
+CREATE TABLE customer_return_details (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    return_id UUID NOT NULL REFERENCES customer_returns(id) ON DELETE CASCADE,
+    batch_id UUID NOT NULL REFERENCES batches(id),
+    quantity INTEGER NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    sync_version INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 18. SUPPLIER RETURNS
 CREATE TABLE supplier_returns (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -300,9 +536,20 @@ CREATE TABLE supplier_returns (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 14. PAYMENTS
--- ============================================
+-- 19. SUPPLIER RETURN DETAILS
+CREATE TABLE supplier_return_details (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    return_id UUID NOT NULL REFERENCES supplier_returns(id) ON DELETE CASCADE,
+    batch_id UUID NOT NULL REFERENCES batches(id),
+    quantity INTEGER NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    sync_version INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 20. PAYMENTS
 CREATE TABLE payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -322,9 +569,7 @@ CREATE TABLE payments (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 15. INVENTORY LOGS
--- ============================================
+-- 21. INVENTORY LOGS
 CREATE TABLE inventory_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -344,9 +589,7 @@ CREATE TABLE inventory_logs (
     created_by UUID REFERENCES users(id)
 );
 
--- ============================================
--- 16. ACTIVITY LOGS
--- ============================================
+-- 22. ACTIVITY LOGS
 CREATE TABLE activity_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -358,9 +601,7 @@ CREATE TABLE activity_logs (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- ============================================
--- 17. CHANGE LOG (Central sync tracking)
--- ============================================
+-- 23. CHANGE LOG
 CREATE TABLE change_log (
     id BIGSERIAL PRIMARY KEY,
     table_name VARCHAR(50) NOT NULL,
@@ -378,9 +619,7 @@ CREATE TABLE change_log (
     source VARCHAR(20) DEFAULT 'desktop'
 );
 
--- ============================================
--- 18. SYNC STATE
--- ============================================
+-- 24. SYNC STATE
 CREATE TABLE sync_state (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pharmacy_id UUID NOT NULL UNIQUE REFERENCES pharmacies(id) ON DELETE CASCADE,
@@ -398,50 +637,51 @@ CREATE TABLE sync_state (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
-
-
-
-
--- Create categories table
-CREATE TABLE IF NOT EXISTS categories (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+-- 25. ID MAPPING
+CREATE TABLE id_mapping (
+    id BIGSERIAL PRIMARY KEY,
     pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
-    name VARCHAR(50) NOT NULL,
-    description TEXT,
+    table_name VARCHAR(50) NOT NULL,
+    local_id INTEGER NOT NULL,
+    cloud_uuid UUID NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    is_deleted BOOLEAN DEFAULT FALSE,
-    sync_version INTEGER DEFAULT 1,
-    source VARCHAR(20) DEFAULT 'desktop'
+    UNIQUE (pharmacy_id, table_name, local_id),
+    UNIQUE (pharmacy_id, table_name, cloud_uuid)
 );
 
--- Add category_id to medicines table
-ALTER TABLE medicines ADD COLUMN category_id UUID REFERENCES categories(id);
+-- 26. UNIT TYPE MAPPING
+CREATE TABLE unit_type_mapping (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    desktop_unit_type_id INTEGER NOT NULL,
+    cloud_unit_type_id UUID NOT NULL REFERENCES unit_types(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(pharmacy_id, desktop_unit_type_id)
+);
 
--- Create indexes
+-- 27. CONFLICT LOG
+CREATE TABLE conflict_log (
+    id BIGSERIAL PRIMARY KEY,
+    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
+    table_name VARCHAR(50) NOT NULL,
+    record_id UUID NOT NULL,
+    conflict_type VARCHAR(20) NOT NULL,
+    desktop_data JSONB,
+    cloud_data JSONB,
+    winner VARCHAR(20) NOT NULL,
+    desktop_updated_at TIMESTAMP,
+    cloud_updated_at TIMESTAMP,
+    resolution_reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- =========================================================
+-- INDEXES
+-- =========================================================
 CREATE INDEX idx_categories_pharmacy ON categories(pharmacy_id);
 CREATE INDEX idx_categories_name ON categories(name);
-CREATE INDEX idx_medicines_category ON medicines(category_id);
 
--- Create trigger for categories
-CREATE TRIGGER update_categories_updated_at 
-    BEFORE UPDATE ON categories 
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-
--- Create trigger for categories change logging
-CREATE TRIGGER log_categories_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON categories 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
-
-
-
-
--- ============================================
--- 19. CREATE INDEXES (AFTER all tables)
--- ============================================
 CREATE INDEX idx_customers_pharmacy ON customers(pharmacy_id);
 CREATE INDEX idx_customers_name ON customers(full_name);
 CREATE INDEX idx_customers_updated ON customers(updated_at);
@@ -449,15 +689,26 @@ CREATE INDEX idx_customers_updated ON customers(updated_at);
 CREATE INDEX idx_suppliers_pharmacy ON suppliers(pharmacy_id);
 CREATE INDEX idx_suppliers_name ON suppliers(name);
 
+CREATE INDEX idx_unit_types_system ON unit_types(is_system);
+
 CREATE INDEX idx_medicines_pharmacy ON medicines(pharmacy_id);
 CREATE INDEX idx_medicines_name ON medicines(name);
 CREATE INDEX idx_medicines_barcode ON medicines(barcode);
+CREATE INDEX idx_medicines_category ON medicines(category_id);
 CREATE INDEX idx_medicines_updated ON medicines(updated_at);
 
 CREATE INDEX idx_batches_pharmacy ON batches(pharmacy_id);
 CREATE INDEX idx_batches_medicine ON batches(medicine_id);
 CREATE INDEX idx_batches_expiry ON batches(expiry_date);
 CREATE INDEX idx_batches_updated ON batches(updated_at);
+
+CREATE INDEX idx_batch_units_batch ON batch_units(batch_id);
+CREATE INDEX idx_batch_units_unit_type ON batch_units(unit_type_id);
+CREATE INDEX idx_batch_units_pharmacy ON batch_units(pharmacy_id);
+
+CREATE INDEX idx_med_template_medicine ON medicine_packaging_templates(medicine_id);
+CREATE INDEX idx_med_template_unit ON medicine_packaging_templates(purchase_unit_id);
+CREATE INDEX idx_med_template_pharmacy ON medicine_packaging_templates(pharmacy_id);
 
 CREATE INDEX idx_invoices_pharmacy ON invoices(pharmacy_id);
 CREATE INDEX idx_invoices_customer ON invoices(customer_id);
@@ -473,456 +724,191 @@ CREATE INDEX idx_bills_supplier ON bills(supplier_id);
 CREATE INDEX idx_bills_number ON bills(bill_number);
 CREATE INDEX idx_bills_updated ON bills(updated_at);
 
-CREATE INDEX idx_changelog_pending ON change_log(pharmacy_id, synced_to_cloud, changed_at);
+CREATE INDEX idx_billdetails_bill ON bill_details(bill_id);
+CREATE INDEX idx_billdetails_medicine ON bill_details(medicine_id);
+
+CREATE INDEX idx_customer_returns_pharmacy ON customer_returns(pharmacy_id);
+CREATE INDEX idx_customer_returns_invoice ON customer_returns(invoice_id);
+
+CREATE INDEX idx_customer_return_details_return ON customer_return_details(return_id);
+CREATE INDEX idx_customer_return_details_batch ON customer_return_details(batch_id);
+
+CREATE INDEX idx_supplier_returns_pharmacy ON supplier_returns(pharmacy_id);
+CREATE INDEX idx_supplier_returns_bill ON supplier_returns(bill_id);
+
+CREATE INDEX idx_supplier_return_details_return ON supplier_return_details(return_id);
+CREATE INDEX idx_supplier_return_details_batch ON supplier_return_details(batch_id);
+
+CREATE INDEX idx_payments_pharmacy ON payments(pharmacy_id);
+CREATE INDEX idx_inventory_logs_pharmacy ON inventory_logs(pharmacy_id);
+CREATE INDEX idx_activity_logs_pharmacy ON activity_logs(pharmacy_id);
+
+CREATE INDEX idx_changelog_pending ON change_log(pharmacy_id, changed_at);
 CREATE INDEX idx_changelog_record ON change_log(table_name, record_id);
-CREATE INDEX idx_changelog_sync_version ON change_log(sync_version);
+CREATE INDEX idx_changelog_sync_version ON change_log(pharmacy_id, sync_version);
 
 CREATE INDEX idx_syncstate_status ON sync_state(sync_status);
 CREATE INDEX idx_syncstate_last_sync ON sync_state(last_sync_at);
 
--- ============================================
--- 20. TRIGGERS
--- ============================================
-CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
+CREATE INDEX idx_id_mapping_pharmacy ON id_mapping(pharmacy_id);
+CREATE INDEX idx_id_mapping_lookup ON id_mapping(pharmacy_id, table_name, local_id);
+CREATE INDEX idx_id_mapping_cloud ON id_mapping(pharmacy_id, table_name, cloud_uuid);
 
+CREATE INDEX idx_unit_type_mapping_pharmacy ON unit_type_mapping(pharmacy_id);
+CREATE INDEX idx_unit_type_mapping_desktop ON unit_type_mapping(desktop_unit_type_id);
+
+CREATE INDEX idx_conflict_log_pharmacy ON conflict_log(pharmacy_id);
+CREATE INDEX idx_conflict_log_created ON conflict_log(created_at);
+
+-- =========================================================
+-- UPDATED_AT TRIGGERS
+-- =========================================================
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_categories_updated_at BEFORE UPDATE ON categories FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_customers_updated_at BEFORE UPDATE ON customers FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_suppliers_updated_at BEFORE UPDATE ON suppliers FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_unit_types_updated_at BEFORE UPDATE ON unit_types FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_medicines_updated_at BEFORE UPDATE ON medicines FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_batches_updated_at BEFORE UPDATE ON batches FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_batch_units_updated_at BEFORE UPDATE ON batch_units FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_med_templates_updated_at BEFORE UPDATE ON medicine_packaging_templates FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_invoices_updated_at BEFORE UPDATE ON invoices FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_invoice_details_updated_at BEFORE UPDATE ON invoice_details FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_bills_updated_at BEFORE UPDATE ON bills FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_bill_details_updated_at BEFORE UPDATE ON bill_details FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_customer_returns_updated_at BEFORE UPDATE ON customer_returns FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_customer_return_details_updated_at BEFORE UPDATE ON customer_return_details FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_supplier_returns_updated_at BEFORE UPDATE ON supplier_returns FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_supplier_return_details_updated_at BEFORE UPDATE ON supplier_return_details FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON payments FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_inventory_logs_updated_at BEFORE UPDATE ON inventory_logs FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_sync_state_updated_at BEFORE UPDATE ON sync_state FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_id_mapping_updated_at BEFORE UPDATE ON id_mapping FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- ============================================
--- 21. INITIAL DATA
--- ============================================
+-- =========================================================
+-- CHANGE LOG TRIGGERS
+-- =========================================================
+CREATE TRIGGER log_users_changes BEFORE INSERT OR UPDATE OR DELETE ON users FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_categories_changes BEFORE INSERT OR UPDATE OR DELETE ON categories FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_customers_changes BEFORE INSERT OR UPDATE OR DELETE ON customers FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_suppliers_changes BEFORE INSERT OR UPDATE OR DELETE ON suppliers FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_unit_types_changes BEFORE INSERT OR UPDATE OR DELETE ON unit_types FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_medicines_changes BEFORE INSERT OR UPDATE OR DELETE ON medicines FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_batches_changes BEFORE INSERT OR UPDATE OR DELETE ON batches FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_batch_units_changes BEFORE INSERT OR UPDATE OR DELETE ON batch_units FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_med_templates_changes BEFORE INSERT OR UPDATE OR DELETE ON medicine_packaging_templates FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_invoices_changes BEFORE INSERT OR UPDATE OR DELETE ON invoices FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_invoice_details_changes BEFORE INSERT OR UPDATE OR DELETE ON invoice_details FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_bills_changes BEFORE INSERT OR UPDATE OR DELETE ON bills FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_bill_details_changes BEFORE INSERT OR UPDATE OR DELETE ON bill_details FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_customer_returns_changes BEFORE INSERT OR UPDATE OR DELETE ON customer_returns FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_customer_return_details_changes BEFORE INSERT OR UPDATE OR DELETE ON customer_return_details FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_supplier_returns_changes BEFORE INSERT OR UPDATE OR DELETE ON supplier_returns FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_supplier_return_details_changes BEFORE INSERT OR UPDATE OR DELETE ON supplier_return_details FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_payments_changes BEFORE INSERT OR UPDATE OR DELETE ON payments FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+CREATE TRIGGER log_inventory_logs_changes BEFORE INSERT OR UPDATE OR DELETE ON inventory_logs FOR EACH ROW EXECUTE FUNCTION log_table_changes();
+
+-- =========================================================
+-- INITIAL DATA
+-- =========================================================
 INSERT INTO roles (id, name, description, permissions) VALUES
 (gen_random_uuid(), 'Administrator', 'Full system access', '{"all": true}'::jsonb),
 (gen_random_uuid(), 'Pharmacist', 'Can manage medicines and sales', '{"medicines": ["view","add","edit"], "sales": ["pos","view"]}'::jsonb),
 (gen_random_uuid(), 'Cashier', 'Processes sales only', '{"sales": ["pos","view"], "customers": ["view","add"]}'::jsonb),
 (gen_random_uuid(), 'Manager', 'Manager with limited deletion', '{"medicines": ["view","add","edit"], "reports": ["view","export"]}'::jsonb),
-(gen_random_uuid(), 'Staff', 'Basic read-only access', '{"medicines": ["view"], "sales": ["view"]}'::jsonb);
-
-
-
-INSERT INTO pharmacies (id, name, hwid, owner_name, phone) 
-VALUES (gen_random_uuid(), 'Khan Pharmacy', 'HWID-TEST-001', 'Amir Khan', '0700123456');
-
-
--- Create the missing function
-CREATE OR REPLACE FUNCTION get_pending_changes(p_pharmacy_id UUID, p_since_version BIGINT)
-RETURNS TABLE(
-    table_name VARCHAR,
-    record_id UUID,
-    operation VARCHAR,
-    new_data JSONB,
-    sync_version INTEGER,
-    changed_at TIMESTAMP
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT 
-        cl.table_name,
-        cl.record_id,
-        cl.operation,
-        cl.new_data,
-        cl.sync_version,
-        cl.changed_at
-    FROM change_log cl
-    WHERE cl.pharmacy_id = p_pharmacy_id
-        AND cl.sync_version > p_since_version
-        AND cl.synced_to_cloud = FALSE
-    ORDER BY cl.sync_version ASC
-    LIMIT 100;
-END;
-$$ LANGUAGE plpgsql;
-
--- Also create the mark function
-CREATE OR REPLACE FUNCTION mark_changes_synced(p_change_ids BIGINT[])
-RETURNS VOID AS $$
-BEGIN
-    UPDATE change_log
-    SET synced_to_cloud = TRUE,
-        synced_at = CURRENT_TIMESTAMP
-    WHERE id = ANY(p_change_ids);
-END;
-$$ LANGUAGE plpgsql;
-
-
-
-
-
--- Customer return details table
-CREATE TABLE IF NOT EXISTS customer_return_details (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    return_id UUID NOT NULL REFERENCES customer_returns(id) ON DELETE CASCADE,
-    batch_id UUID NOT NULL REFERENCES batches(id),
-    quantity INTEGER NOT NULL,
-    unit_price DECIMAL(10,2) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Supplier return details table  
-CREATE TABLE IF NOT EXISTS supplier_return_details (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    return_id UUID NOT NULL REFERENCES supplier_returns(id) ON DELETE CASCADE,
-    batch_id UUID NOT NULL REFERENCES batches(id),
-    quantity INTEGER NOT NULL,
-    unit_price DECIMAL(10,2) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-
-
-
-
-
-
-
--- 1. First, add default value for sync_version if not exists
-ALTER TABLE customers ALTER COLUMN sync_version SET DEFAULT 1;
-
--- Drop existing function
-DROP FUNCTION IF EXISTS log_table_changes() CASCADE;
-
--- Create updated function with proper skip-trigger flag
-CREATE OR REPLACE FUNCTION log_table_changes()
-RETURNS TRIGGER AS $$
-DECLARE
-    old_data_json JSONB;
-    new_data_json JSONB;
-    changed_fields_arr TEXT[];
-    current_sync_ver INTEGER;
-    skip_triggers BOOLEAN;
-BEGIN
-    -- Check if triggers should be skipped (during sync operations)
-    BEGIN
-        skip_triggers := COALESCE(current_setting('app.skip_triggers', TRUE)::boolean, FALSE);
-    EXCEPTION WHEN OTHERS THEN
-        skip_triggers := FALSE;
-    END;
-    
-    IF skip_triggers THEN
-        IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
-            RETURN NEW;
-        ELSE
-            RETURN OLD;
-        END IF;
-    END IF;
-
-    -- Calculate new sync_version
-    IF TG_OP = 'DELETE' THEN
-        current_sync_ver := COALESCE(OLD.sync_version, 0) + 1;
-        old_data_json := to_jsonb(OLD);
-        new_data_json := NULL;
-        changed_fields_arr := ARRAY['*'];
-        
-        INSERT INTO change_log (
-            table_name, record_id, pharmacy_id, operation,
-            old_data, new_data, changed_fields, sync_version,
-            changed_by, source
-        ) VALUES (
-            TG_TABLE_NAME,
-            OLD.id,
-            OLD.pharmacy_id,
-            TG_OP,
-            old_data_json,
-            new_data_json,
-            changed_fields_arr,
-            current_sync_ver,
-            OLD.created_by,
-            COALESCE(OLD.source, 'desktop')
-        );
-        
-        RETURN OLD;
-        
-    ELSIF TG_OP = 'INSERT' THEN
-        current_sync_ver := 1;
-        new_data_json := to_jsonb(NEW);
-        changed_fields_arr := ARRAY['*'];
-        
-        NEW.sync_version := current_sync_ver;
-        
-        INSERT INTO change_log (
-            table_name, record_id, pharmacy_id, operation,
-            old_data, new_data, changed_fields, sync_version,
-            changed_by, source
-        ) VALUES (
-            TG_TABLE_NAME,
-            NEW.id,
-            NEW.pharmacy_id,
-            TG_OP,
-            NULL,
-            new_data_json,
-            changed_fields_arr,
-            current_sync_ver,
-            NEW.created_by,
-            COALESCE(NEW.source, 'desktop')
-        );
-        
-        RETURN NEW;
-        
-    ELSIF TG_OP = 'UPDATE' THEN
-        current_sync_ver := COALESCE(NEW.sync_version, 0) + 1;
-        old_data_json := to_jsonb(OLD);
-        new_data_json := to_jsonb(NEW);
-        
-        -- Get changed fields
-        SELECT array_agg(key) INTO changed_fields_arr
-        FROM jsonb_each(to_jsonb(NEW))
-        WHERE jsonb_each.value::text IS DISTINCT FROM (to_jsonb(OLD)->>key)::text;
-        
-        NEW.sync_version := current_sync_ver;
-        
-        INSERT INTO change_log (
-            table_name, record_id, pharmacy_id, operation,
-            old_data, new_data, changed_fields, sync_version,
-            changed_by, source
-        ) VALUES (
-            TG_TABLE_NAME,
-            NEW.id,
-            NEW.pharmacy_id,
-            TG_OP,
-            old_data_json,
-            new_data_json,
-            changed_fields_arr,
-            current_sync_ver,
-            NEW.created_by,
-            COALESCE(NEW.source, 'desktop')
-        );
-        
-        RETURN NEW;
-    END IF;
-    
-    RETURN COALESCE(NEW, OLD);
-END;
-$$ LANGUAGE plpgsql;
-
--- 3. Drop existing trigger
-DROP TRIGGER IF EXISTS log_customers_changes ON customers;
-
--- 4. Create new trigger
-CREATE TRIGGER log_customers_changes 
-    BEFORE INSERT OR UPDATE OR DELETE ON customers 
-    FOR EACH ROW EXECUTE FUNCTION log_table_changes();
-
-
-
--- ============================================
--- ID MAPPING TABLE (Local INTEGER ↔ Cloud UUID)
--- ============================================
-CREATE TABLE id_mapping (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
-    table_name VARCHAR(50) NOT NULL,
-    local_id INTEGER NOT NULL,
-    cloud_uuid UUID NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(pharmacy_id, table_name, local_id),
-    UNIQUE(cloud_uuid)
-);
-
-CREATE INDEX idx_id_mapping_pharmacy ON id_mapping(pharmacy_id);
-CREATE INDEX idx_id_mapping_lookup ON id_mapping(pharmacy_id, table_name, local_id);
-CREATE INDEX idx_id_mapping_cloud ON id_mapping(cloud_uuid);
-
-
-
--- Add index for faster lookups
-CREATE INDEX IF NOT EXISTS idx_id_mapping_lookup ON id_mapping(pharmacy_id, table_name, local_id);
-CREATE INDEX IF NOT EXISTS idx_id_mapping_cloud ON id_mapping(cloud_uuid);
-
-
-
--- Create mapping table for desktop unit types to cloud unit types
-CREATE TABLE unit_type_mapping (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
-    desktop_unit_type_id INTEGER NOT NULL,  -- Desktop's integer ID
-    cloud_unit_type_id UUID NOT NULL REFERENCES unit_types(id),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(pharmacy_id, desktop_unit_type_id)
-);
-
-CREATE INDEX idx_unit_type_mapping_pharmacy ON unit_type_mapping(pharmacy_id);
-CREATE INDEX idx_unit_type_mapping_desktop ON unit_type_mapping(desktop_unit_type_id);
-
-
-
--- Create batch_units table (one-to-one with batches)
-CREATE TABLE batch_units (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
-    batch_id UUID NOT NULL UNIQUE REFERENCES batches(id) ON DELETE CASCADE,
-    unit_type_id UUID NOT NULL REFERENCES unit_types(id),
-    pack_size INTEGER,
-    subunit_size INTEGER,
-    smallest_unit_factor INTEGER NOT NULL DEFAULT 1,
-    purchase_price_per_unit DECIMAL(10,2) NOT NULL,
-    selling_price_per_unit DECIMAL(10,2) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    is_deleted BOOLEAN DEFAULT FALSE,
-    sync_version INTEGER DEFAULT 1,
-    source VARCHAR(20) DEFAULT 'desktop'
-);
-
--- Remove unit columns from batches table
-ALTER TABLE batches DROP COLUMN IF EXISTS unit_type_id;
-ALTER TABLE batches DROP COLUMN IF EXISTS pack_size;
-ALTER TABLE batches DROP COLUMN IF EXISTS subunit_size;
-ALTER TABLE batches DROP COLUMN IF EXISTS smallest_unit_factor;
-
--- Create indexes
-CREATE INDEX idx_batch_units_batch ON batch_units(batch_id);
-CREATE INDEX idx_batch_units_unit_type ON batch_units(unit_type_id);
-CREATE INDEX idx_batch_units_pharmacy ON batch_units(pharmacy_id);
-
--- Create trigger
-CREATE TRIGGER update_batch_units_updated_at 
-    BEFORE UPDATE ON batch_units 
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-
-
-CREATE TABLE medicine_packaging_templates (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
-    medicine_id UUID NOT NULL REFERENCES medicines(id) ON DELETE CASCADE,
-    purchase_unit_id UUID NOT NULL REFERENCES unit_types(id),
-    pack_size INTEGER,
-    subunit_size INTEGER,
-    smallest_unit_factor INTEGER NOT NULL DEFAULT 1,
-    is_default BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    is_deleted BOOLEAN DEFAULT FALSE,
-    sync_version INTEGER DEFAULT 1,
-    source VARCHAR(20) DEFAULT 'desktop'
-);
-
-CREATE INDEX idx_med_template_medicine ON medicine_packaging_templates(medicine_id);
-CREATE INDEX idx_med_template_unit ON medicine_packaging_templates(purchase_unit_id);
-CREATE INDEX idx_med_template_pharmacy ON medicine_packaging_templates(pharmacy_id);
-
-CREATE TRIGGER update_med_template_updated_at 
-    BEFORE UPDATE ON medicine_packaging_templates 
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-
-
--- Make pharmacy_id nullable (allow NULL for system units)
-ALTER TABLE unit_types ALTER COLUMN pharmacy_id DROP NOT NULL;
-
--- Now add is_system column if not exists
-ALTER TABLE unit_types ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE;
-
--- Now insert default system unit types (pharmacy_id will be NULL)
-INSERT INTO unit_types (id, name, is_smallest_unit, is_system, created_at) VALUES
-(gen_random_uuid(), 'Pack', FALSE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Strip', FALSE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Tablet', TRUE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Capsule', TRUE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Bottle', FALSE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Box', FALSE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Ampoule', TRUE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Vial', FALSE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Sachet', FALSE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Tube', FALSE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Inhaler', FALSE, TRUE, CURRENT_TIMESTAMP),
-(gen_random_uuid(), 'Drop', TRUE, TRUE, CURRENT_TIMESTAMP);
-
--- Create index for system units
-CREATE INDEX IF NOT EXISTS idx_unit_types_system ON unit_types(is_system);
-
-select * from customers;
-
-
-
-
-
-
-
--- Conflict Log Table
-CREATE TABLE conflict_log (
-    id BIGSERIAL PRIMARY KEY,
-    pharmacy_id UUID NOT NULL REFERENCES pharmacies(id) ON DELETE CASCADE,
-    table_name VARCHAR(50) NOT NULL,
-    record_id UUID NOT NULL,
-    conflict_type VARCHAR(20) NOT NULL, -- 'insert_conflict', 'update_conflict'
-    desktop_data JSONB,
-    cloud_data JSONB,
-    winner VARCHAR(20) NOT NULL, -- 'desktop' or 'cloud'
-    desktop_updated_at TIMESTAMP,
-    cloud_updated_at TIMESTAMP,
-    resolution_reason TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_conflict_log_pharmacy ON conflict_log(pharmacy_id);
-CREATE INDEX idx_conflict_log_created ON conflict_log(created_at);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
--- Create the get_pending_changes function
-CREATE OR REPLACE FUNCTION get_pending_changes(p_pharmacy_id UUID, p_since_version BIGINT)
-RETURNS TABLE(
-    table_name VARCHAR,
-    record_id UUID,
-    operation VARCHAR,
-    new_data JSONB,
-    sync_version INTEGER,
-    changed_at TIMESTAMP
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT 
-        cl.table_name,
-        cl.record_id,
-        cl.operation,
-        cl.new_data,
-        cl.sync_version,
-        cl.changed_at
-    FROM change_log cl
-    WHERE cl.pharmacy_id = p_pharmacy_id
-        AND cl.sync_version > p_since_version
-        AND cl.synced_to_cloud = FALSE
-    ORDER BY cl.sync_version ASC
-    LIMIT 100;
-END;
-$$ LANGUAGE plpgsql;
-
--- Create the mark_changes_synced function
-CREATE OR REPLACE FUNCTION mark_changes_synced(p_change_ids BIGINT[])
-RETURNS VOID AS $$
-BEGIN
-    UPDATE change_log
-    SET synced_to_cloud = TRUE,
-        synced_at = CURRENT_TIMESTAMP
-    WHERE id = ANY(p_change_ids);
-END;
-$$ LANGUAGE plpgsql;
+(gen_random_uuid(), 'Staff', 'Basic read-only access', '{"medicines": ["view"], "sales": ["view"]}'::jsonb)
+ON CONFLICT (name) DO NOTHING;
+
+-- system unit types
+INSERT INTO unit_types (id, pharmacy_id, name, is_smallest_unit, is_system, created_at)
+VALUES
+(gen_random_uuid(), NULL, 'Pack', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Strip', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Tablet', TRUE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Capsule', TRUE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Bottle', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Box', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Ampoule', TRUE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Vial', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Sachet', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Tube', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Inhaler', FALSE, TRUE, CURRENT_TIMESTAMP),
+(gen_random_uuid(), NULL, 'Drop', TRUE, TRUE, CURRENT_TIMESTAMP)
+ON CONFLICT DO NOTHING;
+
+COMMIT;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
