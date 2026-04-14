@@ -286,6 +286,32 @@ async def map_desktop_fks_to_cloud_uuids(
         if mapped_uuid:
             data[fk_field] = mapped_uuid
         else:
+            # Special fallback for unit type mapping by name
+            if fk_field in ("unit_type_id", "purchase_unit_id"):
+                unit_name_key = "purchase_unit_name" if fk_field == "purchase_unit_id" else "unit_type_name"
+                unit_name = data.get(unit_name_key)
+
+                if unit_name:
+                    unit_result = await db.execute(
+                        text("""
+                            SELECT id
+                            FROM unit_types
+                            WHERE name = :name
+                              AND (pharmacy_id = :pharmacy_id OR pharmacy_id IS NULL)
+                              AND is_deleted = FALSE
+                            ORDER BY CASE WHEN pharmacy_id = :pharmacy_id THEN 0 ELSE 1 END
+                            LIMIT 1
+                        """),
+                        {
+                            "name": unit_name,
+                            "pharmacy_id": pharmacy_id
+                        }
+                    )
+                    unit_row = unit_result.fetchone()
+                    if unit_row:
+                        data[fk_field] = unit_row[0]
+                        continue
+
             # If local integer FK can't be mapped to a cloud UUID, drop it
             data.pop(fk_field, None)
 
@@ -3740,6 +3766,7 @@ async def get_inventory_logs(
 # ============================================
 # SYNC UPLOAD (Desktop pushes changes)
 # ============================================
+
 @app.post("/api/sync/upload", response_model=SyncUploadResponse)
 async def sync_upload(
     request: SyncUploadRequest,
@@ -3756,117 +3783,128 @@ async def sync_upload(
 
     for change in changes:
         try:
-            table_name = normalize_sync_table_name(change.get("table_name", ""))
-            operation = str(change.get("operation", "")).upper()
+            async with db.begin_nested():
+                table_name = normalize_sync_table_name(change.get("table_name", ""))
+                operation = str(change.get("operation", "")).upper()
 
-            if table_name not in ALLOWED_SYNC_TABLES:
-                errors.append(f"Table not allowed for sync: {table_name}")
-                continue
+                if table_name not in ALLOWED_SYNC_TABLES:
+                    errors.append(f"Table not allowed for sync: {table_name}")
+                    continue
 
-            incoming_updated_at = datetime.fromisoformat(change["updated_at"]) if change.get("updated_at") else datetime.utcnow()
-            local_id = change.get("local_id")
-            incoming_data = dict(change.get("new_data") or {})
+                incoming_updated_at = (
+                    datetime.fromisoformat(change["updated_at"])
+                    if change.get("updated_at")
+                    else datetime.utcnow()
+                )
+                local_id = change.get("local_id")
+                incoming_data = dict(change.get("new_data") or {})
 
-            cloud_uuid = change.get("record_id")
-            if cloud_uuid:
-                record_id = UUID(str(cloud_uuid))
-            else:
-                mapped_uuid = None
+                cloud_uuid = change.get("record_id")
+                if cloud_uuid:
+                    record_id = UUID(str(cloud_uuid))
+                else:
+                    mapped_uuid = None
+                    if local_id is not None:
+                        try:
+                            mapped_uuid = await resolve_local_id_to_cloud_uuid(
+                                db=db,
+                                pharmacy_id=request.pharmacy_id,
+                                table_name=table_name,
+                                local_id=int(local_id),
+                            )
+                        except Exception:
+                            mapped_uuid = None
+                    record_id = mapped_uuid if mapped_uuid else uuid.uuid4()
+
                 if local_id is not None:
                     try:
-                        mapped_uuid = await resolve_local_id_to_cloud_uuid(
+                        await upsert_id_mapping(
                             db=db,
                             pharmacy_id=request.pharmacy_id,
                             table_name=table_name,
                             local_id=int(local_id),
+                            cloud_uuid=record_id,
                         )
-                    except Exception:
-                        mapped_uuid = None
-                record_id = mapped_uuid if mapped_uuid else uuid.uuid4()
+                    except Exception as e:
+                        errors.append(
+                            f"{table_name}/{record_id}: failed to upsert id_mapping: {str(e)}"
+                        )
+                        continue
 
-            if local_id is not None:
-                try:
-                    await upsert_id_mapping(
-                        db=db,
-                        pharmacy_id=request.pharmacy_id,
-                        table_name=table_name,
-                        local_id=int(local_id),
-                        cloud_uuid=record_id,
-                    )
-                except Exception as e:
-                    errors.append(f"{table_name}/{record_id}: failed to upsert id_mapping: {str(e)}")
+                incoming_data = await map_desktop_fks_to_cloud_uuids(
+                    db=db,
+                    pharmacy_id=request.pharmacy_id,
+                    table_name=table_name,
+                    payload=incoming_data,
+                )
+
+                existing_row = await get_existing_record(
+                    db=db,
+                    table_name=table_name,
+                    record_id=record_id,
+                    pharmacy_id=request.pharmacy_id,
+                )
+
+                if operation == "DELETE":
+                    if existing_row:
+                        if await table_has_column(db, table_name, "is_deleted"):
+                            has_pharmacy_id = await table_has_column(db, table_name, "pharmacy_id")
+                            has_updated_at = await table_has_column(db, table_name, "updated_at")
+
+                            delete_query = text(f"""
+                                UPDATE {table_name}
+                                SET is_deleted = TRUE
+                                    {", updated_at = :updated_at" if has_updated_at else ""}
+                                WHERE id = :record_id
+                                  {"AND pharmacy_id = :pharmacy_id" if has_pharmacy_id else ""}
+                                  AND (
+                                      {"updated_at IS NULL OR updated_at <= :updated_at" if has_updated_at else "1=1"}
+                                  )
+                            """)
+
+                            params = {
+                                "record_id": record_id,
+                            }
+                            if has_updated_at:
+                                params["updated_at"] = incoming_updated_at
+                            if has_pharmacy_id:
+                                params["pharmacy_id"] = request.pharmacy_id
+
+                            result = await db.execute(delete_query, params)
+                            if result.rowcount > 0:
+                                processed += 1
+                            else:
+                                conflicts += 1
                     continue
 
-            incoming_data = await map_desktop_fks_to_cloud_uuids(
-                db=db,
-                pharmacy_id=request.pharmacy_id,
-                table_name=table_name,
-                payload=incoming_data,
-            )
+                existing_updated_at = existing_row[1] if existing_row else None
 
-            existing_row = await get_existing_record(
-                db=db,
-                table_name=table_name,
-                record_id=record_id,
-                pharmacy_id=request.pharmacy_id,
-            )
-
-            if operation == "DELETE":
                 if existing_row:
-                    if await table_has_column(db, table_name, "is_deleted"):
-                        has_pharmacy_id = await table_has_column(db, table_name, "pharmacy_id")
-                        delete_query = text(f"""
-                            UPDATE {table_name}
-                            SET is_deleted = TRUE,
-                                updated_at = :updated_at
-                            WHERE id = :record_id
-                              {"AND pharmacy_id = :pharmacy_id" if has_pharmacy_id else ""}
-                              AND (
-                                  {"updated_at IS NULL OR updated_at <= :updated_at" if await table_has_column(db, table_name, "updated_at") else "1=1"}
-                              )
-                        """)
-                        params = {
-                            "record_id": record_id,
-                            "updated_at": incoming_updated_at,
-                        }
-                        if has_pharmacy_id:
-                            params["pharmacy_id"] = request.pharmacy_id
+                    if existing_updated_at and incoming_updated_at <= existing_updated_at:
+                        conflicts += 1
+                        continue
 
-                        result = await db.execute(delete_query, params)
-                        if result.rowcount > 0:
-                            processed += 1
-                        else:
-                            conflicts += 1
-                continue
-
-            existing_updated_at = existing_row[1] if existing_row else None
-
-            if existing_row:
-                if existing_updated_at and incoming_updated_at <= existing_updated_at:
-                    conflicts += 1
-                    continue
-
-                updated_rows = await update_record(
-                    db=db,
-                    table_name=table_name,
-                    record_id=record_id,
-                    data=incoming_data,
-                    pharmacy_id=request.pharmacy_id,
-                    incoming_updated_at=incoming_updated_at,
-                )
-                if updated_rows > 0:
-                    processed += 1
+                    updated_rows = await update_record(
+                        db=db,
+                        table_name=table_name,
+                        record_id=record_id,
+                        data=incoming_data,
+                        pharmacy_id=request.pharmacy_id,
+                        incoming_updated_at=incoming_updated_at,
+                    )
+                    if updated_rows > 0:
+                        processed += 1
+                    else:
+                        conflicts += 1
                 else:
-                    conflicts += 1
-            else:
-                await insert_record(
-                    db=db,
-                    table_name=table_name,
-                    record_id=record_id,
-                    data=incoming_data,
-                    pharmacy_id=request.pharmacy_id,
-                )
-                processed += 1
+                    await insert_record(
+                        db=db,
+                        table_name=table_name,
+                        record_id=record_id,
+                        data=incoming_data,
+                        pharmacy_id=request.pharmacy_id,
+                    )
+                    processed += 1
 
         except Exception as e:
             errors.append(
@@ -3928,7 +3966,6 @@ async def sync_upload(
         new_sync_version=new_sync_version,
         errors=errors,
     )
-
 
 # ============================================
 # CATEGORIES - CRUD Operations
