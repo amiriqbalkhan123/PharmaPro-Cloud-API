@@ -347,7 +347,15 @@ async def insert_record(
     if pharmacy_id is not None and await table_has_column(db, table_name, "pharmacy_id"):
         payload["pharmacy_id"] = pharmacy_id
 
+    # Never allow stale sync metadata from desktop to force DB values
+    payload.pop("sync_version", None)
+    payload.pop("created_at", None)
+    payload.pop("updated_at", None)
+
     filtered = await filter_payload_for_table(db, table_name, payload)
+
+    if not filtered:
+        raise ValueError(f"No valid columns remained for insert into {table_name}")
 
     cols = list(filtered.keys())
     vals = [f":{c}" for c in cols]
@@ -356,7 +364,14 @@ async def insert_record(
         INSERT INTO {table_name} ({', '.join(cols)})
         VALUES ({', '.join(vals)})
     """)
-    await db.execute(query, filtered)
+
+    try:
+        await db.execute(query, filtered)
+    except Exception as e:
+        raise RuntimeError(
+            f"insert_record failed for {table_name}. "
+            f"Columns={cols}. Payload={filtered}. Error={str(e)}"
+        )
 
 
 async def update_record(
@@ -3778,8 +3793,9 @@ async def sync_upload(
                         local_id=int(local_id),
                         cloud_uuid=record_id,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    errors.append(f"{table_name}/{record_id}: failed to upsert id_mapping: {str(e)}")
+                    continue
 
             incoming_data = await map_desktop_fks_to_cloud_uuids(
                 db=db,
@@ -3798,19 +3814,22 @@ async def sync_upload(
             if operation == "DELETE":
                 if existing_row:
                     if await table_has_column(db, table_name, "is_deleted"):
+                        has_pharmacy_id = await table_has_column(db, table_name, "pharmacy_id")
                         delete_query = text(f"""
                             UPDATE {table_name}
                             SET is_deleted = TRUE,
                                 updated_at = :updated_at
                             WHERE id = :record_id
-                              {"AND pharmacy_id = :pharmacy_id" if await table_has_column(db, table_name, "pharmacy_id") else ""}
-                              AND (updated_at IS NULL OR updated_at <= :updated_at)
+                              {"AND pharmacy_id = :pharmacy_id" if has_pharmacy_id else ""}
+                              AND (
+                                  {"updated_at IS NULL OR updated_at <= :updated_at" if await table_has_column(db, table_name, "updated_at") else "1=1"}
+                              )
                         """)
                         params = {
                             "record_id": record_id,
                             "updated_at": incoming_updated_at,
                         }
-                        if await table_has_column(db, table_name, "pharmacy_id"):
+                        if has_pharmacy_id:
                             params["pharmacy_id"] = request.pharmacy_id
 
                         result = await db.execute(delete_query, params)
@@ -3850,9 +3869,21 @@ async def sync_upload(
                 processed += 1
 
         except Exception as e:
-            errors.append(f"{change.get('table_name')}/{change.get('record_id')}: {str(e)}")
+            errors.append(
+                f"{change.get('table_name')}/{change.get('record_id')}: {type(e).__name__}: {str(e)}"
+            )
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        return SyncUploadResponse(
+            success=False,
+            records_processed=processed,
+            conflicts_resolved=conflicts,
+            new_sync_version=request.sync_version,
+            errors=[f"Commit failed: {type(e).__name__}: {str(e)}"] + errors
+        )
 
     current_version_result = await db.execute(
         text("""
@@ -3864,27 +3895,31 @@ async def sync_upload(
     )
     new_sync_version = current_version_result.scalar() or request.sync_version
 
-    await db.execute(
-        text("""
-            UPDATE sync_state
-            SET last_sync_at = NOW(),
-                last_sync_version = :last_sync_version,
-                total_records_synced = total_records_synced + :processed,
-                total_errors = total_errors + :error_count,
-                sync_status = CASE WHEN :error_count > 0 THEN 'completed_with_errors' ELSE 'completed' END,
-                last_error = :last_error,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE pharmacy_id = :pharmacy_id
-        """),
-        {
-            "last_sync_version": new_sync_version,
-            "processed": processed,
-            "error_count": len(errors),
-            "last_error": errors[-1] if errors else None,
-            "pharmacy_id": request.pharmacy_id,
-        },
-    )
-    await db.commit()
+    try:
+        await db.execute(
+            text("""
+                UPDATE sync_state
+                SET last_sync_at = NOW(),
+                    last_sync_version = :last_sync_version,
+                    total_records_synced = total_records_synced + :processed,
+                    total_errors = total_errors + :error_count,
+                    sync_status = CASE WHEN :error_count > 0 THEN 'completed_with_errors' ELSE 'completed' END,
+                    last_error = :last_error,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE pharmacy_id = :pharmacy_id
+            """),
+            {
+                "last_sync_version": new_sync_version,
+                "processed": processed,
+                "error_count": len(errors),
+                "last_error": errors[-1] if errors else None,
+                "pharmacy_id": request.pharmacy_id,
+            },
+        )
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        errors.append(f"sync_state update failed: {type(e).__name__}: {str(e)}")
 
     return SyncUploadResponse(
         success=True,
@@ -4154,345 +4189,6 @@ async def sync_download(
 
 
 
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
-async def update_record(db: AsyncSession, table_name: str, record_id: UUID, data: dict, updated_at: datetime):
-    """Update record with last-write-wins"""
-    # Remove id and pharmacy_id from data if present
-    data.pop("id", None)
-    data.pop("pharmacy_id", None)
-
-    # Build SET clause
-    set_clause = ", ".join([f"{key} = :{key}" for key in data.keys()])
-    query = text(f"""
-        UPDATE {table_name}
-        SET {set_clause}, updated_at = :updated_at, sync_version = sync_version + 1
-        WHERE id = :record_id AND (updated_at < :updated_at OR updated_at IS NULL)
-    """)
-
-    params = {**data, "record_id": record_id, "updated_at": updated_at}
-    await db.execute(query, params)
-
-
-async def insert_record(db: AsyncSession, table_name: str, record_id: UUID, data: dict,
-                        updated_at: datetime, pharmacy_id: UUID, local_id: int = None):
-    """Insert new record with proper UUID resolution and FK mapping"""
-
-    # ========== SECURITY: Whitelist table name ==========
-    if table_name not in ALLOWED_SYNC_TABLES:
-        print(f"   ❌ REJECTED: Table '{table_name}' not in whitelist")
-        raise ValueError(f"Table '{table_name}' is not allowed for sync operations")
-
-    # Remove fields that shouldn't be inserted directly
-    data.pop("id", None)
-    data.pop("pharmacy_id", None)
-    data.pop("created_at", None)
-
-    # The record_id passed in should be the cloud_uuid (from mapping or newly generated)
-    actual_id = record_id
-
-    print(f"   📝 Inserting into {table_name} with ID: {actual_id}")
-
-    # ========== SAVE ID MAPPING (if local_id provided) ==========
-    if local_id is not None:
-        print(f"   💾 Saving id_mapping: {table_name} local_id={local_id} -> {actual_id}")
-        await db.execute(
-            text("""
-                INSERT INTO id_mapping (pharmacy_id, table_name, local_id, cloud_uuid)
-                VALUES (:pharmacy_id, :table_name, :local_id, :cloud_uuid)
-                ON CONFLICT (pharmacy_id, table_name, local_id) 
-                DO UPDATE SET cloud_uuid = :cloud_uuid, updated_at = CURRENT_TIMESTAMP
-            """),
-            {
-                "pharmacy_id": pharmacy_id,
-                "table_name": table_name,
-                "local_id": local_id,
-                "cloud_uuid": actual_id
-            }
-        )
-
-    # ========== FK UUID RESOLUTION ==========
-    fk_mappings = {
-        'pharmacy_id': 'pharmacies',
-        'role_id': 'roles',
-        'category_id': 'categories',
-        'medicine_id': 'medicines',
-        'customer_id': 'customers',
-        'supplier_id': 'suppliers',
-        'batch_id': 'batches',
-        'invoice_id': 'invoices',
-        'bill_id': 'bills',
-        'unit_type_id': 'unit_types',
-        'purchase_unit_id': 'unit_types',
-        'return_id': 'customer_returns',
-        'payment_id': 'payments',
-        'user_id': 'users',
-        'created_by': 'users',
-        'reference_id': None  # Special handling based on reference_type
-    }
-
-    for fk_field, fk_table in fk_mappings.items():
-        if fk_field in data and data[fk_field] is not None and data[fk_field] != "":
-            local_fk_value = data[fk_field]
-
-            # Skip if it's already a valid UUID
-            if isinstance(local_fk_value, str) and len(local_fk_value) == 36 and '-' in local_fk_value:
-                try:
-                    UUID(local_fk_value)
-                    continue  # Already a valid UUID
-                except ValueError:
-                    pass  # Not a UUID, needs mapping
-
-            # Try to convert to int (local INTEGER ID)
-            try:
-                local_id_val = int(local_fk_value)
-
-                # Special handling for reference_id which needs reference_type
-                if fk_field == 'reference_id' and 'party_type' in data:
-                    if data['party_type'] == 'customer':
-                        fk_table = 'customers'
-                    elif data['party_type'] == 'supplier':
-                        fk_table = 'suppliers'
-                    elif data['party_type'] == 'invoice':
-                        fk_table = 'invoices'
-                    else:
-                        data[fk_field] = None
-                        continue
-                elif fk_table is None:
-                    continue  # Skip if we can't determine the table
-
-                # Look up cloud UUID from id_mapping
-                mapping_result = await db.execute(
-                    text("""
-                        SELECT cloud_uuid FROM id_mapping 
-                        WHERE pharmacy_id = :pharmacy_id 
-                            AND table_name = :table_name 
-                            AND local_id = :local_id
-                    """),
-                    {
-                        "pharmacy_id": pharmacy_id,
-                        "table_name": fk_table,
-                        "local_id": local_id_val
-                    }
-                )
-                mapping_row = mapping_result.fetchone()
-                if mapping_row:
-                    data[fk_field] = str(mapping_row[0])
-                    print(f"   ✅ Mapped FK {fk_field}: {local_id_val} -> {mapping_row[0]}")
-                else:
-                    print(f"   ⚠️ FK {fk_field}={local_id_val} not found in id_mapping for {fk_table}")
-                    # CRITICAL: Set to NULL if mapping not found to avoid FK violation
-                    data[fk_field] = None
-            except (ValueError, TypeError):
-                # Not an integer, leave as is (might be UUID string already)
-                pass
-
-    # ========== BUILD INSERT DATA ==========
-    insert_data = {
-        "id": actual_id,
-        "pharmacy_id": pharmacy_id,
-        "updated_at": updated_at,
-        "sync_version": 1,
-        "source": "desktop"
-    }
-
-    # Field mapping from SQLite to PostgreSQL
-    field_mapping = {
-        'full_name': 'full_name',
-        'fullname': 'fullname',
-        'name': 'name',
-        'description': 'description',
-        'phone': 'phone',
-        'email': 'email',
-        'address': 'address',
-        'balance': 'balance',
-        'credit_limit': 'credit_limit',
-        'total_purchases': 'total_purchases',
-        'total_payments': 'total_payments',
-        'last_payment_date': 'last_payment_date',
-        'brand': 'brand',
-        'generic_name': 'generic_name',
-        'strength': 'strength',
-        'dosage_form': 'dosage_form',
-        'barcode': 'barcode',
-        'batch_number': 'batch_number',
-        'expiry_date': 'expiry_date',
-        'purchase_price': 'purchase_price',
-        'selling_price': 'selling_price',
-        'quantity_received': 'quantity_received',
-        'quantity_remaining': 'quantity_remaining',
-        'invoice_number': 'invoice_number',
-        'invoice_date': 'invoice_date',
-        'total_amount': 'total_amount',
-        'discount': 'discount',
-        'net_amount': 'net_amount',
-        'status': 'status',
-        'is_credit': 'is_credit',
-        'amount_paid': 'amount_paid',
-        'balance_due': 'balance_due',
-        'due_date': 'due_date',
-        'pack_size': 'pack_size',
-        'subunit_size': 'subunit_size',
-        'smallest_unit_factor': 'smallest_unit_factor',
-        'is_default': 'is_default',
-        'return_date': 'return_date',
-        'reason': 'reason',
-        'party_type': 'party_type',
-        'method': 'method',
-        'payment_date': 'payment_date',
-        'notes': 'notes',
-        'quantity': 'quantity',
-        'unit_price': 'unit_price',
-        'unit_quantity': 'unit_quantity',
-        'permissions': 'permissions',
-        'is_active': 'is_active',
-        'is_verified': 'is_verified',
-        'is_deleted': 'is_deleted',
-        'deleted_at': 'deleted_at',
-        'username': 'username',
-        'password_hash': 'password_hash',
-        'owner_name': 'owner_name',
-        'city': 'city',
-        'province': 'province',
-        'subscription_type': 'subscription_type',
-        'subscription_expiry': 'subscription_expiry',
-        'hwid': 'hwid',
-        'contact_person': 'contact_person',
-        'before_quantity': 'before_quantity',
-        'after_quantity': 'after_quantity',
-        'before_smallest_units': 'before_smallest_units',
-        'after_smallest_units': 'after_smallest_units',
-        'change_type': 'change_type',
-        'reference_type': 'reference_type',
-        'action': 'action',
-        'module': 'module',
-        'ip_address': 'ip_address',
-        'purchase_price_per_unit': 'purchase_price_per_unit',
-        'selling_price_per_unit': 'selling_price_per_unit',
-        'is_smallest_unit': 'is_smallest_unit',
-        'is_system': 'is_system'
-    }
-
-    # Add mapped fields
-    for key, value in data.items():
-        if value is not None and value != "":
-            pg_key = field_mapping.get(key, key)
-
-            # Handle date/time fields
-            if pg_key in ['expiry_date', 'last_payment_date', 'due_date', 'return_date',
-                          'payment_date', 'invoice_date', 'bill_date', 'deleted_at',
-                          'subscription_expiry']:
-                if isinstance(value, str):
-                    try:
-                        # Handle ISO format with or without timezone
-                        clean_value = value.replace('Z', '+00:00')
-                        insert_data[pg_key] = datetime.fromisoformat(clean_value)
-                    except:
-                        pass
-                elif isinstance(value, datetime):
-                    insert_data[pg_key] = value
-
-            # Handle JSON fields
-            elif pg_key == 'permissions':
-                if isinstance(value, str):
-                    try:
-                        insert_data[pg_key] = json.loads(value)
-                    except:
-                        insert_data[pg_key] = value
-                else:
-                    insert_data[pg_key] = value
-
-            # Handle numeric/decimal fields
-            elif pg_key in ['balance', 'credit_limit', 'total_purchases', 'total_payments',
-                            'purchase_price', 'selling_price', 'total_amount', 'discount',
-                            'net_amount', 'amount_paid', 'balance_due', 'unit_price',
-                            'purchase_price_per_unit', 'selling_price_per_unit']:
-                try:
-                    insert_data[pg_key] = float(value) if value is not None else 0
-                except (ValueError, TypeError):
-                    insert_data[pg_key] = 0
-
-            # Handle integer fields
-            elif pg_key in ['quantity_received', 'quantity_remaining', 'quantity',
-                            'unit_quantity', 'pack_size', 'subunit_size', 'smallest_unit_factor',
-                            'sync_version']:
-                try:
-                    insert_data[pg_key] = int(value) if value is not None else 0
-                except (ValueError, TypeError):
-                    insert_data[pg_key] = 0
-
-            # Handle boolean fields
-            elif pg_key in ['is_credit', 'is_default', 'is_active', 'is_verified',
-                            'is_deleted', 'is_smallest_unit', 'is_system']:
-                if isinstance(value, bool):
-                    insert_data[pg_key] = value
-                elif isinstance(value, int):
-                    insert_data[pg_key] = bool(value)
-                elif isinstance(value, str):
-                    insert_data[pg_key] = value.lower() in ('true', '1', 'yes')
-
-            # Handle UUID fields (already resolved above)
-            elif pg_key in fk_mappings.keys():
-                if value is not None:
-                    try:
-                        insert_data[pg_key] = UUID(value) if isinstance(value, str) else value
-                    except (ValueError, TypeError):
-                        insert_data[pg_key] = None
-
-            # Default: string fields
-            else:
-                insert_data[pg_key] = str(value)[:255] if value else None
-
-    # ========== EXECUTE INSERT ==========
-    columns = list(insert_data.keys())
-    placeholders = [f":{col}" for col in columns]
-
-    query = text(f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})")
-
-    try:
-        print(f"   📝 Executing INSERT with {len(columns)} columns")
-        await db.execute(query, insert_data)
-        print(f"   ✅ INSERT successful for {table_name}")
-
-        # ========== HANDLE BATCH_UNITS CREATION ==========
-        if table_name == 'batches':
-            unit_type_id = data.get('unit_type_id')
-
-            if unit_type_id:
-                batch_unit_id = uuid.uuid4()
-                await db.execute(
-                    text("""
-                        INSERT INTO batch_units (
-                            id, pharmacy_id, batch_id, unit_type_id, pack_size, 
-                            subunit_size, smallest_unit_factor, purchase_price_per_unit, 
-                            selling_price_per_unit, source
-                        )
-                        VALUES (
-                            :id, :pharmacy_id, :batch_id, :unit_type_id, :pack_size,
-                            :subunit_size, :smallest_unit_factor, :purchase_price, 
-                            :selling_price, 'desktop'
-                        )
-                        ON CONFLICT (batch_id) DO NOTHING
-                    """),
-                    {
-                        "id": batch_unit_id,
-                        "pharmacy_id": pharmacy_id,
-                        "batch_id": actual_id,
-                        "unit_type_id": UUID(unit_type_id) if isinstance(unit_type_id, str) else unit_type_id,
-                        "pack_size": data.get('pack_size'),
-                        "subunit_size": data.get('subunit_size'),
-                        "smallest_unit_factor": data.get('smallest_unit_factor', 1),
-                        "purchase_price": data.get('purchase_price', 0),
-                        "selling_price": data.get('selling_price', 0)
-                    }
-                )
-                print(f"   ✅ Created batch_units for batch")
-
-    except Exception as e:
-        print(f"   ❌ Insert error for {table_name}: {e}")
-        print(f"   Columns: {columns}")
-        raise
 ## Unit Types mapping endpoint
 @app.post("/api/unit-types/map")
 async def map_unit_type(
